@@ -36,9 +36,10 @@ const SCENES = {
         ipPath: path.join(__dirname, "assets", "layers", "digital-ark-green", "ip.svg"),
         boatPath: path.join(__dirname, "assets", "layers", "digital-ark-green", "boat.svg"),
         ipLayout: { height: 520, left: 565, top: 72 },
-        personLayout: { width: 440, height: 560, left: 125, top: 92 },
+        personSourceSafeArea: { width: 590, height: 875, left: 190, top: 75 },
+        personCanvas: { width: 650, height: 650, left: 0, top: 38 },
         boatLayout: { width: 920, left: 52, top: 290 },
-        composition: "Create one isolated seated chibi guest in a relaxed three-quarter-body pose, facing the camera and smiling. Keep both arms and hands simple, visible and close to the body. The body must fit comfortably behind the front edge of a boat when composited later."
+        composition: "Create one isolated chibi guest sitting on the front-left rim of an invisible boat. Show the complete character from head through the seated hips, both arms and both bent legs; never crop the body into a bust portrait. The guest faces the camera with the torso angled slightly toward the companion on the viewer's right. The right hand makes one simple friendly wave toward that companion; the left hand rests naturally near the bent knee. Keep the exact placement and scale of the pose reference."
     }
 };
 const Q_STYLE_REFERENCE_PATH = path.join(__dirname, "assets", "q-style-reference.jpg");
@@ -167,8 +168,8 @@ async function removeBackgroundWithLeonardo(imageUrl) {
         body: JSON.stringify({
             model: 'remove-bg', public: false, ephemeral: true, base64: true,
             parameters: {
-                size: 'auto', type: 'graphic', channels: 'rgba', format: 'png', crop: true,
-                crop_margin: '4%', semitransparency: true, shadow_type: 'none', quantity: 1,
+                size: 'auto', type: 'graphic', channels: 'rgba', format: 'png', crop: false,
+                semitransparency: true, shadow_type: 'none', quantity: 1,
                 guidances: { image_reference: [{ image: { url: imageUrl, type: 'URL' } }] }
             }
         })
@@ -228,7 +229,8 @@ async function removeMagentaBackgroundLocally(imageBuffer) {
         data[index * channels + 3] = alpha;
     }
 
-    return sharp(data, { raw: info }).png().trim({ background: { r: 0, g: 0, b: 0, alpha: 0 } }).toBuffer();
+    // 保留原始 1024×1024 座標；不可裁切後再自動放大，否則人物會偏位或只剩頭部。
+    return sharp(data, { raw: info }).png().toBuffer();
 }
 
 async function createPersonCutout(imageUrl) {
@@ -247,15 +249,53 @@ async function resizeSvgLayer(filePath, options) {
     return sharp(filePath, { density: 216 }).resize(options).png().toBuffer();
 }
 
+async function normalizePersonToPoseCanvas(scene, personCutout) {
+    const trimmed = await sharp(personCutout)
+        .ensureAlpha()
+        .trim({ background: { r: 0, g: 0, b: 0, alpha: 0 }, threshold: 12 })
+        .png()
+        .toBuffer({ resolveWithObject: true });
+
+    if (trimmed.info.width > 995 && trimmed.info.height > 995) {
+        throw new Error('人物去背未成功，無法進行固定座位合成');
+    }
+
+    const safeArea = scene.personSourceSafeArea;
+    const normalizedSubject = await sharp(trimmed.data)
+        .resize({
+            width: safeArea.width,
+            height: safeArea.height,
+            fit: 'contain',
+            position: 'top',
+            withoutEnlargement: false,
+            background: { r: 0, g: 0, b: 0, alpha: 0 }
+        })
+        .png()
+        .toBuffer();
+
+    return sharp({
+        create: {
+            width: 1024,
+            height: 1024,
+            channels: 4,
+            background: { r: 0, g: 0, b: 0, alpha: 0 }
+        }
+    })
+        .composite([{ input: normalizedSubject, left: safeArea.left, top: safeArea.top }])
+        .png()
+        .toBuffer();
+}
+
 async function compositeFixedScene(scene, personCutout) {
+    const normalizedPersonCanvas = await normalizePersonToPoseCanvas(scene, personCutout);
     const [ipLayer, boatLayer, personLayer] = await Promise.all([
         resizeSvgLayer(scene.ipPath, { height: scene.ipLayout.height, fit: 'inside' }),
         resizeSvgLayer(scene.boatPath, { width: scene.boatLayout.width, fit: 'inside' }),
-        sharp(personCutout).resize({
-            width: scene.personLayout.width,
-            height: scene.personLayout.height,
+        sharp(normalizedPersonCanvas).resize({
+            width: scene.personCanvas.width,
+            height: scene.personCanvas.height,
             fit: 'contain',
-            position: 'bottom',
+            position: 'centre',
             background: { r: 0, g: 0, b: 0, alpha: 0 }
         }).png().toBuffer()
     ]);
@@ -264,8 +304,9 @@ async function compositeFixedScene(scene, personCutout) {
         .resize(OUTPUT_WIDTH, OUTPUT_HEIGHT)
         .composite([
             { input: ipLayer, left: scene.ipLayout.left, top: scene.ipLayout.top },
-            { input: personLayer, left: scene.personLayout.left, top: scene.personLayout.top },
-            { input: boatLayer, left: scene.boatLayout.left, top: scene.boatLayout.top }
+            { input: boatLayer, left: scene.boatLayout.left, top: scene.boatLayout.top },
+            // 人物坐在船緣上方，不再被整艘船遮到只剩頭；人物畫布本身就是安全區。
+            { input: personLayer, left: scene.personCanvas.left, top: scene.personCanvas.top }
         ])
         .flatten({ background: '#fffdf8' })
         .jpeg({ quality: 90, chromaSubsampling: '4:4:4' })
@@ -293,7 +334,7 @@ async function requestLeonardoGeneration(model, styleId, prompt, guestImageId, s
                 guidances: {
                     image_reference: [
                         { image: { id: guestImageId, type: "UPLOADED" }, strength: "MID" },
-                        { image: { id: sceneReferenceId, type: "UPLOADED" }, strength: "LOW" },
+                        { image: { id: sceneReferenceId, type: "UPLOADED" }, strength: "HIGH" },
                         { image: { id: qStyleReferenceId, type: "UPLOADED" }, strength: "HIGH" }
                     ]
                 }
@@ -314,8 +355,8 @@ async function generateLeonardoDualStyles(taskId, base64Image, sceneId) {
         const qStyleReferenceId = await getQStyleReferenceId();
         console.log(`⚡ 啟動「${scene.name}」雙模型 Q 版人物生成，完成後再固定分層合成...`);
 
-        const identityRules = "Reference 1 is the photographed guest and is the only identity reference. Preserve recognizable cues from the guest: hairstyle, hair color, glasses, clothing colors and accessories, but do not render a realistic adult face. Reference 2 is pose guidance only; follow its centered seated silhouette without copying its colors. Reference 3 is style only: copy its cute chibi proportions, simple facial language, textured outline and flat coloring, but never copy that reference person's identity, hairstyle, glasses or clothing.";
-        const isolationRules = "Generate exactly one isolated human guest. Do not generate any mascot, animal, boat, vehicle, scenery, prop, logo, letters or extra person. Use one perfectly uniform solid pure magenta #FF00FF background from edge to edge, with no texture, gradient, shadow or floor. Keep a generous clear margin around the complete character. Hands must be small, simple and anatomically clean, with no extra fingers or duplicated limbs.";
+        const identityRules = "Reference 1 is the photographed guest and is the only identity reference. Preserve recognizable cues from the guest: hairstyle, hair color, glasses, clothing colors and accessories, but do not render a realistic adult face. Reference 2 is strict full-canvas pose and placement guidance only: keep the smaller head, complete seated torso, raised right hand and two bent legs in the same coordinates, without copying its gray colors. Reference 3 is style only: copy its cute chibi proportions, simple facial language, textured outline and flat coloring, but never copy that reference person's identity, hairstyle, glasses or clothing.";
+        const isolationRules = "Generate exactly one isolated human guest and show the complete seated character, never a bust portrait or head-only portrait. Keep the character inside the left 75 percent of the square canvas and leave the right side clear for a fixed mascot added later. Do not generate any mascot, animal, boat, vehicle, scenery, prop, logo, letters or extra person. Use one perfectly uniform solid pure magenta #FF00FF background from edge to edge, with no texture, gradient, shadow or floor. Keep clear margin around the complete character. Hands must be small, simple and anatomically clean, with no extra fingers or duplicated limbs.";
         const promptA = `${identityRules} ${scene.composition} ${isolationRules} Transform the guest into an unmistakably super-cute chibi character with a very large round head, tiny compact body, about 2.5 heads tall, big simple oval black eyes, tiny nose and mouth, rosy cheeks, short simplified limbs, slightly thick hand-drawn crayon outlines, flat clean colors and almost no realistic shading. Match the original cute avatar style, not anime realism, watercolor portrait realism or photographic skin.`;
         const promptB = `${identityRules} ${scene.composition} ${isolationRules} Transform the guest into a recognizable chibi character about 3 heads tall. Keep more of the guest's face shape and personal features than version A while still using a large head, compact body, simple oval eyes, small nose and mouth, rosy cheeks, textured hand-drawn outlines, controlled flat colors and light paper texture. Match the original cute avatar style; avoid realistic facial rendering, realistic skin pores, long adult proportions and semi-photorealistic watercolor.`;
 
@@ -526,4 +567,16 @@ app.post('/api/admin/update-meta/:taskId', async (req, res) => {
     res.json({ success: true });
 });
 
-app.listen(PORT, () => { console.log(`🚀 雙重風格叫號伺服器運行中，監聽 PORT: ${PORT}`); });
+if (require.main === module) {
+    app.listen(PORT, () => { console.log(`🚀 雙重風格叫號伺服器運行中，監聽 PORT: ${PORT}`); });
+}
+
+module.exports = {
+    app,
+    testHelpers: {
+        SCENES,
+        removeMagentaBackgroundLocally,
+        normalizePersonToPoseCanvas,
+        compositeFixedScene
+    }
+};

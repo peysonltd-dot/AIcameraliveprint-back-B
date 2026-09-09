@@ -1,16 +1,25 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <rect width="1024" height="1024" fill="#ff00ff"/>
-  <g fill="#56505d" stroke="#27232b" stroke-width="20" stroke-linecap="round" stroke-linejoin="round">
-    <circle cx="512" cy="280" r="178"/>
-    <path d="M356 442c44-48 104-72 156-72s112 24 156 72l32 226c8 58-35 104-91 104H415c-56 0-99-46-91-104z"/>
-    <path d="M390 530c-58 38-92 102-99 184" fill="none"/>
-    <path d="M634 530c58 38 92 102 99 184" fill="none"/>
-    <path d="M414 748c-54 42-84 95-98 163" fill="none"/>
-    <path d="M610 748c54 42 84 95 98 163" fill="none"/>
+  <!-- Fixed full-canvas pose guide: seated on the left rim, waving toward the IP on the right. -->
+  <g fill="#5a5560" stroke="#28242c" stroke-width="18" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="430" cy="248" r="146"/>
+    <path d="M330 398c34-38 78-57 124-57 67 0 123 34 151 92l34 168c13 66-34 122-101 122H391c-69 0-117-60-99-126z"/>
   </g>
-  <g fill="#fff" opacity="0.9">
-    <ellipse cx="450" cy="270" rx="25" ry="38"/>
-    <ellipse cx="574" cy="270" rx="25" ry="38"/>
+  <g fill="none" stroke="#28242c" stroke-width="82" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M342 455c-41 70-51 143-25 219"/>
+    <path d="M561 454c52-49 99-91 132-142"/>
+    <path d="M417 688c-72 40-123 105-150 194"/>
+    <path d="M521 688c93 32 158 88 202 166"/>
   </g>
-  <path d="M470 340c28 22 56 22 84 0" fill="none" stroke="#fff" stroke-width="15" stroke-linecap="round"/>
+  <g fill="#5a5560" stroke="#28242c" stroke-width="14">
+    <circle cx="695" cy="301" r="45"/>
+    <circle cx="315" cy="680" r="43"/>
+    <circle cx="258" cy="895" r="44"/>
+    <circle cx="732" cy="868" r="44"/>
+  </g>
+  <g fill="#f7f5f2">
+    <ellipse cx="382" cy="240" rx="22" ry="34"/>
+    <ellipse cx="480" cy="240" rx="22" ry="34"/>
+  </g>
+  <path d="M390 303c27 20 54 20 81 0" fill="none" stroke="#f7f5f2" stroke-width="14" stroke-linecap="round"/>
 </svg>
