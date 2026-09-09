@@ -5,6 +5,8 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { initializeApp } = require('firebase/app');
 const { getFirestore, doc, setDoc, getDoc, collection, getDocs, updateDoc, deleteDoc } = require('firebase/firestore');
 
@@ -22,6 +24,14 @@ let useFirebase = false;
 
 const appId = (process.env.APP_ID || "photo-booth-app").trim();
 const LEONARDO_API_KEY = (process.env.LEONARDO_API_KEY || "").trim();
+const SCENES = {
+    "digital-ark-green": {
+        name: "與綠色 IP 共乘數位方舟",
+        referencePath: path.join(__dirname, "assets", "test-scene-reference.jpg"),
+        composition: "Create one friendly group portrait inside the same colorful digital ark. The photographed guest sits on the left and the approved green-and-cream education mascot sits on the right. They are close companions, face the camera and smile. Keep their bodies clearly separated: no handshake, no high-five, no interlocked fingers and no merged limbs. Preserve the ark's teal, navy, cream, yellow and orange circuit-board design and the airy blue watercolor splash atmosphere."
+    }
+};
+const sceneReferenceCache = new Map();
 
 // Firebase 初始化 (僅在開機時連線一次)
 if (process.env.FIREBASE_CONFIG) {
@@ -89,7 +99,7 @@ async function triggerFeiePrint(task) {
     } catch (err) {}
 }
 
-async function uploadToLeonardoS3(base64Image) {
+async function uploadBufferToLeonardoS3(imageBuffer, label = 'image') {
     try {
         const initUploadRes = await fetch('https://cloud.leonardo.ai/api/rest/v1/init-image', {
             method: 'POST', headers: { 'accept': 'application/json', 'authorization': `Bearer ${LEONARDO_API_KEY}`, 'content-type': 'application/json' },
@@ -99,46 +109,71 @@ async function uploadToLeonardoS3(base64Image) {
 
         const uploadData = await initUploadRes.json();
         const { id, url, fields } = uploadData.uploadInitImage;
-        const imageBuffer = Buffer.from(base64Image.replace(/^data:image\/\w+;base64,/, ""), 'base64');
-
         const formData = new FormData();
         Object.entries(JSON.parse(fields)).forEach(([key, value]) => { formData.append(key, value); });
         formData.append('file', new Blob([imageBuffer], { type: 'image/jpeg' }), 'image.jpg');
 
         const s3UploadRes = await fetch(url, { method: 'POST', body: formData });
         if (s3UploadRes.status >= 200 && s3UploadRes.status < 300) {
-            console.log(`✅ 客人照片成功上傳 Leonardo S3! 取得 ID: ${id}`); return id;
+            console.log(`✅ ${label}成功上傳 Leonardo S3，ID: ${id}`); return id;
         } else { throw new Error(`S3 上傳失敗: ${s3UploadRes.status}`); }
     } catch (err) { throw err; }
 }
 
-async function generateLeonardoDualStyles(taskId, base64Image) {
+async function uploadToLeonardoS3(base64Image) {
+    const imageBuffer = Buffer.from(base64Image.replace(/^data:image\/\w+;base64,/, ""), 'base64');
+    return uploadBufferToLeonardoS3(imageBuffer, '客人照片');
+}
+
+async function getSceneReferenceId(sceneId) {
+    if (sceneReferenceCache.has(sceneId)) return sceneReferenceCache.get(sceneId);
+    const scene = SCENES[sceneId];
+    if (!scene) throw new Error(`未知的互動情境：${sceneId}`);
+    const referenceBuffer = fs.readFileSync(scene.referencePath);
+    const referenceId = await uploadBufferToLeonardoS3(referenceBuffer, `情境參考圖「${scene.name}」`);
+    sceneReferenceCache.set(sceneId, referenceId);
+    return referenceId;
+}
+
+async function requestLeonardoGeneration(model, styleId, prompt, guestImageId, sceneReferenceId) {
+    const response = await fetch('https://cloud.leonardo.ai/api/rest/v2/generations', {
+        method: 'POST',
+        headers: { 'accept': 'application/json', 'authorization': `Bearer ${LEONARDO_API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+            model, public: false,
+            parameters: {
+                height: 768, width: 1024, prompt_enhance: "OFF", quantity: 1, quality: "LOW",
+                style_ids: [styleId], prompt,
+                guidances: {
+                    image_reference: [
+                        { image: { id: guestImageId, type: "UPLOADED" }, strength: "HIGH" },
+                        { image: { id: sceneReferenceId, type: "UPLOADED" }, strength: "MID" }
+                    ]
+                }
+            }
+        })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || data.message || `Leonardo 生圖請求失敗：${response.status}`);
+    return data.generate?.generationId || data.generationId || data.sdGenerationJob?.generationId;
+}
+
+async function generateLeonardoDualStyles(taskId, base64Image, sceneId) {
     try {
+        const scene = SCENES[sceneId];
+        if (!scene) throw new Error(`未知的互動情境：${sceneId}`);
         const guestImageId = await uploadToLeonardoS3(base64Image);
-        console.log(`⚡ 啟動 Promise.all 雙通道，對 Leonardo 併發雙模型生圖請求 (LOW Quality)...`);
+        const sceneReferenceId = await getSceneReferenceId(sceneId);
+        console.log(`⚡ 啟動「${scene.name}」雙模型互動合影生成...`);
 
-        const promptA = "Please analyze the physical characteristics of the person in the photo I uploaded (including hairstyle, hair color, clothing style and color, whether they wear glasses or have any special accessories). Then, retain these personal characteristics and reshape it into a new image with the following specific style:\n\nDetailed Style Specifications:\n\nMain Style: Minimalist hand-drawn chibi avatar.\n\nLine Strokes: Slightly thick black outlines with a hand-drawn feel, and rough edges resembling crayon or pencil strokes.\n\nColor and Shadows: Simple, flat coloring without complex gradients or shadows.\n\nFacial Features: Extremely simplified facial features (e.g., round eyes, small nose), with two cute little wisps of light pink blush on the cheeks.\n\nBackground and Composition: Solid white clean background.";
-        const promptB = "Please analyze the physical characteristics of the person in the photo I uploaded (including hairstyle, hair color, clothing style and color, whether they wear glasses or have any special accessories). Then, retain these personal characteristics and reshape it into a new image with the following specific style:\n\nDetailed Style Specifications:\n\nMain Style: Minimalist hand-drawn chibi avatar.\n\nLine Strokes: Slightly thick black outlines with a hand-drawn feel, and rough edges resembling crayon or pencil strokes.\n\nColor and Shadows: Simple, flat coloring without complex gradients or shadows.\n\nFacial Features: Extremely simplified facial features (e.g., bean eyes, small nose), with two cute little wisps of light pink blush on the cheeks.\n\nBackground and Composition: Solid white clean background.";
+        const identityRules = "The first reference image is the photographed guest and is the only identity reference. Faithfully preserve the guest's face, hairstyle, hair color, glasses, clothing colors and accessories. The second reference image is only the approved scene, mascot and composition reference. Replace the example human from that scene with the photographed guest; never copy the example human's face, cap, glasses, backpack or printed shirt. Show exactly one human and exactly one mascot. Do not invent extra people, mascots, text or logos.";
+        const promptA = `${identityRules} ${scene.composition} Render the guest in a polished soft watercolor illustration that matches the supplied scene. Keep hands anatomically simple and visible. Balanced 4:3 souvenir photo composition.`;
+        const promptB = `${identityRules} ${scene.composition} Render the guest in a clean, bright 2D illustrated style that closely matches the official event key visual, with soft paper texture and controlled flat colors. Keep hands anatomically simple and visible. Balanced 4:3 souvenir photo composition.`;
 
-        const [genRequestA, genRequestB] = await Promise.all([
-            fetch('https://cloud.leonardo.ai/api/rest/v2/generations', {
-                method: 'POST', headers: { 'accept': 'application/json', 'authorization': `Bearer ${LEONARDO_API_KEY}`, 'content-type': 'application/json' },
-                body: JSON.stringify({
-                    "model": "gemini-2.5-flash-image", "public": false,
-                    "parameters": { "height": 1024, "width": 1024, "prompt_enhance": "OFF", "quantity": 1, "quality": "LOW", "style_ids": ["6fedbf1f-4a17-45ec-84fb-92fe524a29ef"], "prompt": promptA, "guidances": { "image_reference": [{ "image": { "id": guestImageId, "type": "UPLOADED" }, "strength": "MID" }] } }
-                })
-            }).then(r => r.json()),
-            fetch('https://cloud.leonardo.ai/api/rest/v2/generations', {
-                method: 'POST', headers: { 'accept': 'application/json', 'authorization': `Bearer ${LEONARDO_API_KEY}`, 'content-type': 'application/json' },
-                body: JSON.stringify({
-                    "model": "gpt-image-2", "public": false,
-                    "parameters": { "height": 1024, "width": 1024, "prompt_enhance": "OFF", "quantity": 1, "quality": "LOW", "style_ids": ["645e4195-f63d-4715-a3f2-3fb1e6eb8c70"], "prompt": promptB, "guidances": { "image_reference": [{ "image": { "id": guestImageId, "type": "UPLOADED" }, "strength": "MID" }] } }
-                })
-            }).then(r => r.json())
+        const [genIdA, genIdB] = await Promise.all([
+            requestLeonardoGeneration("gemini-2.5-flash-image", "6fedbf1f-4a17-45ec-84fb-92fe524a29ef", promptA, guestImageId, sceneReferenceId),
+            requestLeonardoGeneration("gpt-image-2", "645e4195-f63d-4715-a3f2-3fb1e6eb8c70", promptB, guestImageId, sceneReferenceId)
         ]);
-
-        const genIdA = genRequestA.generate?.generationId || genRequestA.generationId || genRequestA.sdGenerationJob?.generationId;
-        const genIdB = genRequestB.generate?.generationId || genRequestB.generationId || genRequestB.sdGenerationJob?.generationId;
 
         if (!genIdA || !genIdB) { throw new Error("無法取得官方任務 ID。"); }
 
@@ -194,21 +229,27 @@ async function pollAndSaveResults(taskId, genIdA, genIdB) {
 
 app.post('/api/upload', async (req, res) => {
     try {
-        const { image } = req.body;
+        const { image, sceneId = "digital-ark-green" } = req.body;
         if (!image) return res.status(400).json({ error: '未提供圖片資料' });
+        const scene = SCENES[sceneId];
+        if (!scene) return res.status(400).json({ error: '不支援的互動情境' });
 
         const taskId = String(ticketCounter).padStart(3, '0');
         ticketCounter++;
 
-        const newTask = { id: taskId, sourceImage: image, status: 'pending', resultImageA: null, resultImageB: null, chosenDesign: null, processStatus: '製作中', remark: '', createdAt: new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false }) };
+        const newTask = { id: taskId, sourceImage: image, sceneId, sceneName: scene.name, status: 'pending', resultImageA: null, resultImageB: null, chosenDesign: null, processStatus: '製作中', remark: '', createdAt: new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false }) };
         localTasksCache[taskId] = newTask;
         if (useFirebase) await setDoc(doc(db, 'artifacts', appId, 'public', taskId), newTask);
 
         console.log(`🎫 新任務建立：排隊號碼 #${taskId}`);
         res.json({ success: true, taskId: taskId });
 
-        if (LEONARDO_API_KEY) generateLeonardoDualStyles(taskId, image);
+        if (LEONARDO_API_KEY) generateLeonardoDualStyles(taskId, image, sceneId);
     } catch (error) { res.status(500).json({ error: '伺服器錯誤' }); }
+});
+
+app.get('/health', (_req, res) => {
+    res.json({ success: true, booth: 'B', scenes: Object.keys(SCENES), firebase: useFirebase });
 });
 
 app.get('/api/status/:taskId', async (req, res) => {
