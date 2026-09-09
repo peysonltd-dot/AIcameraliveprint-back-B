@@ -31,7 +31,9 @@ const SCENES = {
         composition: "Create one friendly group portrait inside the same colorful digital ark. The photographed guest sits on the left and the approved green-and-cream education mascot sits on the right. They are close companions, face the camera and smile. Keep their bodies clearly separated: no handshake, no high-five, no interlocked fingers and no merged limbs. Preserve the ark's teal, navy, cream, yellow and orange circuit-board design and the airy blue watercolor splash atmosphere."
     }
 };
+const Q_STYLE_REFERENCE_PATH = path.join(__dirname, "assets", "q-style-reference.jpg");
 const sceneReferenceCache = new Map();
+let qStyleReferenceCache = null;
 
 // Firebase 初始化 (僅在開機時連線一次)
 if (process.env.FIREBASE_CONFIG) {
@@ -135,7 +137,14 @@ async function getSceneReferenceId(sceneId) {
     return referenceId;
 }
 
-async function requestLeonardoGeneration(model, styleId, prompt, guestImageId, sceneReferenceId) {
+async function getQStyleReferenceId() {
+    if (qStyleReferenceCache) return qStyleReferenceCache;
+    const referenceBuffer = fs.readFileSync(Q_STYLE_REFERENCE_PATH);
+    qStyleReferenceCache = await uploadBufferToLeonardoS3(referenceBuffer, 'Q 版畫風參考圖');
+    return qStyleReferenceCache;
+}
+
+async function requestLeonardoGeneration(model, styleId, prompt, guestImageId, sceneReferenceId, qStyleReferenceId) {
     const response = await fetch('https://cloud.leonardo.ai/api/rest/v2/generations', {
         method: 'POST',
         headers: { 'accept': 'application/json', 'authorization': `Bearer ${LEONARDO_API_KEY}`, 'content-type': 'application/json' },
@@ -146,8 +155,9 @@ async function requestLeonardoGeneration(model, styleId, prompt, guestImageId, s
                 style_ids: [styleId], prompt,
                 guidances: {
                     image_reference: [
-                        { image: { id: guestImageId, type: "UPLOADED" }, strength: "HIGH" },
-                        { image: { id: sceneReferenceId, type: "UPLOADED" }, strength: "MID" }
+                        { image: { id: guestImageId, type: "UPLOADED" }, strength: "MID" },
+                        { image: { id: sceneReferenceId, type: "UPLOADED" }, strength: "LOW" },
+                        { image: { id: qStyleReferenceId, type: "UPLOADED" }, strength: "HIGH" }
                     ]
                 }
             }
@@ -164,15 +174,17 @@ async function generateLeonardoDualStyles(taskId, base64Image, sceneId) {
         if (!scene) throw new Error(`未知的互動情境：${sceneId}`);
         const guestImageId = await uploadToLeonardoS3(base64Image);
         const sceneReferenceId = await getSceneReferenceId(sceneId);
+        const qStyleReferenceId = await getQStyleReferenceId();
         console.log(`⚡ 啟動「${scene.name}」雙模型互動合影生成...`);
 
-        const identityRules = "The first reference image is the photographed guest and is the only identity reference. Faithfully preserve the guest's face, hairstyle, hair color, glasses, clothing colors and accessories. The second reference image is only the approved scene, mascot and composition reference. Replace the example human from that scene with the photographed guest; never copy the example human's face, cap, glasses, backpack or printed shirt. Show exactly one human and exactly one mascot. Do not invent extra people, mascots, text or logos.";
-        const promptA = `${identityRules} ${scene.composition} Render the guest in a polished soft watercolor illustration that matches the supplied scene. Keep hands anatomically simple and visible. Balanced 4:3 souvenir photo composition.`;
-        const promptB = `${identityRules} ${scene.composition} Render the guest in a clean, bright 2D illustrated style that closely matches the official event key visual, with soft paper texture and controlled flat colors. Keep hands anatomically simple and visible. Balanced 4:3 souvenir photo composition.`;
+        const identityRules = "Reference 1 is the photographed guest and is the only identity reference. Preserve recognizable cues from the guest: hairstyle, hair color, glasses, clothing colors and accessories, but do not render a realistic adult face. Reference 2 is only the approved digital ark, green mascot and composition reference. Replace its sample human completely; never copy that person's face, cap, glasses, backpack, body proportions or printed shirt. Reference 3 is style only: copy its cute chibi proportions, simple facial language, textured outline and flat coloring, but never copy that reference person's identity, hairstyle, glasses or clothing. Show exactly one human guest and exactly one green-and-cream mascot. Do not invent extra people, mascots, text or logos.";
+        const safetyRules = "Keep the guest and mascot close and friendly but physically separate. No handshake, high-five, interlocked fingers, hugging, merged limbs, extra fingers or duplicated body parts. Keep hands small, simple and clearly visible. Balanced 4:3 souvenir photo composition.";
+        const promptA = `${identityRules} ${scene.composition} ${safetyRules} Transform the guest into an unmistakably super-cute chibi character with a very large round head, tiny compact seated body, about 2.5 heads tall, big simple oval black eyes, tiny nose and mouth, rosy cheeks, short simplified limbs, slightly thick hand-drawn crayon outlines, flat clean colors and almost no realistic shading. Match the original cute avatar style, not anime realism, not watercolor portrait realism and not photographic skin.`;
+        const promptB = `${identityRules} ${scene.composition} ${safetyRules} Transform the guest into a recognizable chibi character about 3 heads tall. Keep more of the guest's face shape and personal features than version A while still using a large head, compact body, simple oval eyes, small nose and mouth, rosy cheeks, textured hand-drawn outlines, controlled flat colors and light paper texture. Match the original cute avatar style; avoid realistic facial rendering, realistic skin pores, long adult proportions and semi-photorealistic watercolor.`;
 
         const [genIdA, genIdB] = await Promise.all([
-            requestLeonardoGeneration("gemini-2.5-flash-image", "6fedbf1f-4a17-45ec-84fb-92fe524a29ef", promptA, guestImageId, sceneReferenceId),
-            requestLeonardoGeneration("gpt-image-2", "645e4195-f63d-4715-a3f2-3fb1e6eb8c70", promptB, guestImageId, sceneReferenceId)
+            requestLeonardoGeneration("gemini-2.5-flash-image", "6fedbf1f-4a17-45ec-84fb-92fe524a29ef", promptA, guestImageId, sceneReferenceId, qStyleReferenceId),
+            requestLeonardoGeneration("gpt-image-2", "645e4195-f63d-4715-a3f2-3fb1e6eb8c70", promptB, guestImageId, sceneReferenceId, qStyleReferenceId)
         ]);
 
         if (!genIdA || !genIdB) { throw new Error("無法取得官方任務 ID。"); }
