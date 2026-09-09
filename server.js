@@ -7,6 +7,7 @@ const cors = require('cors');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const sharp = require('sharp');
 const { initializeApp } = require('firebase/app');
 const { getFirestore, doc, setDoc, getDoc, collection, getDocs, updateDoc, deleteDoc } = require('firebase/firestore');
 
@@ -24,11 +25,20 @@ let useFirebase = false;
 
 const appId = (process.env.APP_ID || "photo-booth-app").trim();
 const LEONARDO_API_KEY = (process.env.LEONARDO_API_KEY || "").trim();
+const REMOVE_BG_MODE = (process.env.REMOVE_BG_MODE || "local").trim().toLowerCase();
+const OUTPUT_WIDTH = 1024;
+const OUTPUT_HEIGHT = 768;
 const SCENES = {
     "digital-ark-green": {
         name: "與綠色 IP 共乘數位方舟",
-        referencePath: path.join(__dirname, "assets", "test-scene-reference.jpg"),
-        composition: "Create one friendly group portrait inside the same colorful digital ark. The photographed guest sits on the left and the approved green-and-cream education mascot sits on the right. They are close companions, face the camera and smile. Keep their bodies clearly separated: no handshake, no high-five, no interlocked fingers and no merged limbs. Preserve the ark's teal, navy, cream, yellow and orange circuit-board design and the airy blue watercolor splash atmosphere."
+        referencePath: path.join(__dirname, "assets", "layers", "digital-ark-green", "pose-reference.jpg"),
+        backgroundPath: path.join(__dirname, "assets", "layers", "digital-ark-green", "background.svg"),
+        ipPath: path.join(__dirname, "assets", "layers", "digital-ark-green", "ip.svg"),
+        boatPath: path.join(__dirname, "assets", "layers", "digital-ark-green", "boat.svg"),
+        ipLayout: { height: 520, left: 565, top: 72 },
+        personLayout: { width: 440, height: 560, left: 125, top: 92 },
+        boatLayout: { width: 920, left: 52, top: 290 },
+        composition: "Create one isolated seated chibi guest in a relaxed three-quarter-body pose, facing the camera and smiling. Keep both arms and hands simple, visible and close to the body. The body must fit comfortably behind the front edge of a boat when composited later."
     }
 };
 const Q_STYLE_REFERENCE_PATH = path.join(__dirname, "assets", "q-style-reference.jpg");
@@ -144,6 +154,133 @@ async function getQStyleReferenceId() {
     return qStyleReferenceCache;
 }
 
+async function downloadImageBuffer(url, label = '圖片') {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`${label}下載失敗：${response.status}`);
+    return Buffer.from(await response.arrayBuffer());
+}
+
+async function removeBackgroundWithLeonardo(imageUrl) {
+    const response = await fetch('https://cloud.leonardo.ai/api/rest/v2/generationssync', {
+        method: 'POST',
+        headers: { 'accept': 'application/json', 'authorization': `Bearer ${LEONARDO_API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+            model: 'remove-bg', public: false, ephemeral: true, base64: true,
+            parameters: {
+                size: 'auto', type: 'graphic', channels: 'rgba', format: 'png', crop: true,
+                crop_margin: '4%', semitransparency: true, shadow_type: 'none', quantity: 1,
+                guidances: { image_reference: [{ image: { url: imageUrl, type: 'URL' } }] }
+            }
+        })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || data.message || `Leonardo 去背失敗：${response.status}`);
+    const encoded = data.results?.[0]?.dataB64;
+    if (!encoded) throw new Error('Leonardo 去背沒有回傳圖片');
+    return Buffer.from(encoded.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+}
+
+async function removeMagentaBackgroundLocally(imageBuffer) {
+    const { data, info } = await sharp(imageBuffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    const { width, height, channels } = info;
+    const pixelCount = width * height;
+    const visited = new Uint8Array(pixelCount);
+    const queue = new Int32Array(pixelCount);
+    let head = 0;
+    let tail = 0;
+
+    const distanceFromKey = (pixelIndex) => {
+        const offset = pixelIndex * channels;
+        const redDelta = 255 - data[offset];
+        const greenDelta = data[offset + 1];
+        const blueDelta = 255 - data[offset + 2];
+        return Math.sqrt(redDelta * redDelta + greenDelta * greenDelta + blueDelta * blueDelta);
+    };
+    const enqueueIfBackground = (pixelIndex) => {
+        if (visited[pixelIndex] || distanceFromKey(pixelIndex) > 190) return;
+        visited[pixelIndex] = 1;
+        queue[tail++] = pixelIndex;
+    };
+
+    for (let x = 0; x < width; x++) {
+        enqueueIfBackground(x);
+        enqueueIfBackground((height - 1) * width + x);
+    }
+    for (let y = 1; y < height - 1; y++) {
+        enqueueIfBackground(y * width);
+        enqueueIfBackground(y * width + width - 1);
+    }
+
+    while (head < tail) {
+        const index = queue[head++];
+        const x = index % width;
+        const y = Math.floor(index / width);
+        if (x > 0) enqueueIfBackground(index - 1);
+        if (x + 1 < width) enqueueIfBackground(index + 1);
+        if (y > 0) enqueueIfBackground(index - width);
+        if (y + 1 < height) enqueueIfBackground(index + width);
+    }
+
+    for (let index = 0; index < pixelCount; index++) {
+        if (!visited[index]) continue;
+        const distance = distanceFromKey(index);
+        const alpha = distance <= 70 ? 0 : Math.round(Math.min(1, (distance - 70) / 120) * 255);
+        data[index * channels + 3] = alpha;
+    }
+
+    return sharp(data, { raw: info }).png().trim({ background: { r: 0, g: 0, b: 0, alpha: 0 } }).toBuffer();
+}
+
+async function createPersonCutout(imageUrl) {
+    if (REMOVE_BG_MODE === 'leonardo') {
+        try {
+            return await removeBackgroundWithLeonardo(imageUrl);
+        } catch (error) {
+            console.error(`⚠️ Leonardo 去背失敗，改用本機備援：${error.message}`);
+        }
+    }
+    const imageBuffer = await downloadImageBuffer(imageUrl, 'AI 人物圖');
+    return removeMagentaBackgroundLocally(imageBuffer);
+}
+
+async function resizeSvgLayer(filePath, options) {
+    return sharp(filePath, { density: 216 }).resize(options).png().toBuffer();
+}
+
+async function compositeFixedScene(scene, personCutout) {
+    const [ipLayer, boatLayer, personLayer] = await Promise.all([
+        resizeSvgLayer(scene.ipPath, { height: scene.ipLayout.height, fit: 'inside' }),
+        resizeSvgLayer(scene.boatPath, { width: scene.boatLayout.width, fit: 'inside' }),
+        sharp(personCutout).resize({
+            width: scene.personLayout.width,
+            height: scene.personLayout.height,
+            fit: 'contain',
+            position: 'bottom',
+            background: { r: 0, g: 0, b: 0, alpha: 0 }
+        }).png().toBuffer()
+    ]);
+
+    const finalBuffer = await sharp(scene.backgroundPath, { density: 144 })
+        .resize(OUTPUT_WIDTH, OUTPUT_HEIGHT)
+        .composite([
+            { input: ipLayer, left: scene.ipLayout.left, top: scene.ipLayout.top },
+            { input: personLayer, left: scene.personLayout.left, top: scene.personLayout.top },
+            { input: boatLayer, left: scene.boatLayout.left, top: scene.boatLayout.top }
+        ])
+        .flatten({ background: '#fffdf8' })
+        .jpeg({ quality: 90, chromaSubsampling: '4:4:4' })
+        .toBuffer();
+
+    return `data:image/jpeg;base64,${finalBuffer.toString('base64')}`;
+}
+
+async function finalizeGeneratedPerson(sceneId, imageUrl) {
+    const scene = SCENES[sceneId];
+    if (!scene) throw new Error(`未知的互動情境：${sceneId}`);
+    const cutout = await createPersonCutout(imageUrl);
+    return compositeFixedScene(scene, cutout);
+}
+
 async function requestLeonardoGeneration(model, styleId, prompt, guestImageId, sceneReferenceId, qStyleReferenceId) {
     const response = await fetch('https://cloud.leonardo.ai/api/rest/v2/generations', {
         method: 'POST',
@@ -151,7 +288,7 @@ async function requestLeonardoGeneration(model, styleId, prompt, guestImageId, s
         body: JSON.stringify({
             model, public: false,
             parameters: {
-                height: 768, width: 1024, prompt_enhance: "OFF", quantity: 1, quality: "LOW",
+                height: 1024, width: 1024, prompt_enhance: "OFF", quantity: 1, quality: "LOW",
                 style_ids: [styleId], prompt,
                 guidances: {
                     image_reference: [
@@ -175,12 +312,12 @@ async function generateLeonardoDualStyles(taskId, base64Image, sceneId) {
         const guestImageId = await uploadToLeonardoS3(base64Image);
         const sceneReferenceId = await getSceneReferenceId(sceneId);
         const qStyleReferenceId = await getQStyleReferenceId();
-        console.log(`⚡ 啟動「${scene.name}」雙模型互動合影生成...`);
+        console.log(`⚡ 啟動「${scene.name}」雙模型 Q 版人物生成，完成後再固定分層合成...`);
 
-        const identityRules = "Reference 1 is the photographed guest and is the only identity reference. Preserve recognizable cues from the guest: hairstyle, hair color, glasses, clothing colors and accessories, but do not render a realistic adult face. Reference 2 is only the approved digital ark, green mascot and composition reference. Replace its sample human completely; never copy that person's face, cap, glasses, backpack, body proportions or printed shirt. Reference 3 is style only: copy its cute chibi proportions, simple facial language, textured outline and flat coloring, but never copy that reference person's identity, hairstyle, glasses or clothing. Show exactly one human guest and exactly one green-and-cream mascot. Do not invent extra people, mascots, text or logos.";
-        const safetyRules = "Keep the guest and mascot close and friendly but physically separate. No handshake, high-five, interlocked fingers, hugging, merged limbs, extra fingers or duplicated body parts. Keep hands small, simple and clearly visible. Balanced 4:3 souvenir photo composition.";
-        const promptA = `${identityRules} ${scene.composition} ${safetyRules} Transform the guest into an unmistakably super-cute chibi character with a very large round head, tiny compact seated body, about 2.5 heads tall, big simple oval black eyes, tiny nose and mouth, rosy cheeks, short simplified limbs, slightly thick hand-drawn crayon outlines, flat clean colors and almost no realistic shading. Match the original cute avatar style, not anime realism, not watercolor portrait realism and not photographic skin.`;
-        const promptB = `${identityRules} ${scene.composition} ${safetyRules} Transform the guest into a recognizable chibi character about 3 heads tall. Keep more of the guest's face shape and personal features than version A while still using a large head, compact body, simple oval eyes, small nose and mouth, rosy cheeks, textured hand-drawn outlines, controlled flat colors and light paper texture. Match the original cute avatar style; avoid realistic facial rendering, realistic skin pores, long adult proportions and semi-photorealistic watercolor.`;
+        const identityRules = "Reference 1 is the photographed guest and is the only identity reference. Preserve recognizable cues from the guest: hairstyle, hair color, glasses, clothing colors and accessories, but do not render a realistic adult face. Reference 2 is pose guidance only; follow its centered seated silhouette without copying its colors. Reference 3 is style only: copy its cute chibi proportions, simple facial language, textured outline and flat coloring, but never copy that reference person's identity, hairstyle, glasses or clothing.";
+        const isolationRules = "Generate exactly one isolated human guest. Do not generate any mascot, animal, boat, vehicle, scenery, prop, logo, letters or extra person. Use one perfectly uniform solid pure magenta #FF00FF background from edge to edge, with no texture, gradient, shadow or floor. Keep a generous clear margin around the complete character. Hands must be small, simple and anatomically clean, with no extra fingers or duplicated limbs.";
+        const promptA = `${identityRules} ${scene.composition} ${isolationRules} Transform the guest into an unmistakably super-cute chibi character with a very large round head, tiny compact body, about 2.5 heads tall, big simple oval black eyes, tiny nose and mouth, rosy cheeks, short simplified limbs, slightly thick hand-drawn crayon outlines, flat clean colors and almost no realistic shading. Match the original cute avatar style, not anime realism, watercolor portrait realism or photographic skin.`;
+        const promptB = `${identityRules} ${scene.composition} ${isolationRules} Transform the guest into a recognizable chibi character about 3 heads tall. Keep more of the guest's face shape and personal features than version A while still using a large head, compact body, simple oval eyes, small nose and mouth, rosy cheeks, textured hand-drawn outlines, controlled flat colors and light paper texture. Match the original cute avatar style; avoid realistic facial rendering, realistic skin pores, long adult proportions and semi-photorealistic watercolor.`;
 
         const [genIdA, genIdB] = await Promise.all([
             requestLeonardoGeneration("gemini-2.5-flash-image", "6fedbf1f-4a17-45ec-84fb-92fe524a29ef", promptA, guestImageId, sceneReferenceId, qStyleReferenceId),
@@ -202,40 +339,70 @@ async function generateLeonardoDualStyles(taskId, base64Image, sceneId) {
 }
 
 async function pollAndSaveResults(taskId, genIdA, genIdB) {
-    let resultA = null; let resultB = null; let attempts = 0; const maxAttempts = 180; 
+    let resultA = null;
+    let resultB = null;
+    let rawUrlA = null;
+    let rawUrlB = null;
+    let attempts = 0;
+    const maxAttempts = 180;
+    const sceneId = localTasksCache[taskId]?.sceneId || 'digital-ark-green';
+
     while (attempts < maxAttempts && (!resultA || !resultB)) {
-        await new Promise(r => setTimeout(r, 2000)); attempts++;
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        attempts++;
         try {
-            if (!resultA) {
-                const resA = await fetch(`https://cloud.leonardo.ai/api/rest/v1/generations/${genIdA}`, { headers: { 'authorization': `Bearer ${LEONARDO_API_KEY}` } }).then(r => r.json());
+            if (!rawUrlA && resultA !== 'FAILED') {
+                const resA = await fetch(`https://cloud.leonardo.ai/api/rest/v1/generations/${genIdA}`, { headers: { 'authorization': `Bearer ${LEONARDO_API_KEY}` } }).then(response => response.json());
                 const jobA = resA.generations_by_pk;
-                if (attempts === 1 || attempts % 5 === 0) console.log(`🔍 [進度轉播] #${taskId} A款目前狀態: ${jobA?.status || JSON.stringify(resA)}`);
-                if (jobA && jobA.status === "COMPLETE" && jobA.generated_images && jobA.generated_images.length > 0) {
-                    resultA = jobA.generated_images[0].url; localTasksCache[taskId].resultImageA = resultA;
-                } else if (jobA && jobA.status === "FAILED") {
-                    console.log(`❌ [警告] #${taskId} A款被官方退件 (FAILED)`); resultA = "FAILED";
-                }
+                if (attempts === 1 || attempts % 5 === 0) console.log(`🔍 [進度轉播] #${taskId} 超 Q 人物狀態: ${jobA?.status || JSON.stringify(resA)}`);
+                if (jobA?.status === 'COMPLETE' && jobA.generated_images?.length > 0) rawUrlA = jobA.generated_images[0].url;
+                if (jobA?.status === 'FAILED') resultA = 'FAILED';
             }
-            if (!resultB) {
-                const resB = await fetch(`https://cloud.leonardo.ai/api/rest/v1/generations/${genIdB}`, { headers: { 'authorization': `Bearer ${LEONARDO_API_KEY}` } }).then(r => r.json());
+
+            if (!rawUrlB && resultB !== 'FAILED') {
+                const resB = await fetch(`https://cloud.leonardo.ai/api/rest/v1/generations/${genIdB}`, { headers: { 'authorization': `Bearer ${LEONARDO_API_KEY}` } }).then(response => response.json());
                 const jobB = resB.generations_by_pk;
-                if (attempts === 1 || attempts % 5 === 0) console.log(`🔍 [進度轉播] #${taskId} B款目前狀態: ${jobB?.status || JSON.stringify(resB)}`);
-                if (jobB && jobB.status === "COMPLETE" && jobB.generated_images && jobB.generated_images.length > 0) {
-                    resultB = jobB.generated_images[0].url; localTasksCache[taskId].resultImageB = resultB;
-                } else if (jobB && jobB.status === "FAILED") {
-                    console.log(`❌ [警告] #${taskId} B款被官方退件 (FAILED)`); resultB = "FAILED";
-                }
+                if (attempts === 1 || attempts % 5 === 0) console.log(`🔍 [進度轉播] #${taskId} 相似 Q 人物狀態: ${jobB?.status || JSON.stringify(resB)}`);
+                if (jobB?.status === 'COMPLETE' && jobB.generated_images?.length > 0) rawUrlB = jobB.generated_images[0].url;
+                if (jobB?.status === 'FAILED') resultB = 'FAILED';
             }
-            if (resultA && resultB && resultA !== "FAILED" && resultB !== "FAILED") {
+
+            const finalizationJobs = [];
+            if (rawUrlA && !resultA) {
+                finalizationJobs.push(finalizeGeneratedPerson(sceneId, rawUrlA).then(image => {
+                    resultA = image;
+                    localTasksCache[taskId].resultImageA = image;
+                    console.log(`✅ #${taskId} 超 Q 版已完成去背與固定 IP 分層合成`);
+                }));
+            }
+            if (rawUrlB && !resultB) {
+                finalizationJobs.push(finalizeGeneratedPerson(sceneId, rawUrlB).then(image => {
+                    resultB = image;
+                    localTasksCache[taskId].resultImageB = image;
+                    console.log(`✅ #${taskId} 相似 Q 版已完成去背與固定 IP 分層合成`);
+                }));
+            }
+            if (finalizationJobs.length > 0) await Promise.all(finalizationJobs);
+
+            if (resultA && resultB && resultA !== 'FAILED' && resultB !== 'FAILED') {
                 localTasksCache[taskId].status = 'completed';
-                if (useFirebase) await updateDoc(doc(db, 'artifacts', appId, 'public', taskId), { resultImageA: resultA, resultImageB: resultB, status: 'completed' });
-                console.log(`🎉 號碼牌 #${taskId} 雙風格全自動生成成功並同步完畢！`);
+                if (useFirebase) {
+                    await updateDoc(doc(db, 'artifacts', appId, 'public', taskId), {
+                        resultImageA: resultA,
+                        resultImageB: resultB,
+                        status: 'completed'
+                    });
+                }
+                console.log(`🎉 號碼牌 #${taskId} 固定 IP 雙款合影完成！`);
                 break;
             }
-        } catch (e) { console.error(`⚠️ 輪詢 #${taskId} 異常:`, e.message); }
+        } catch (error) {
+            console.error(`⚠️ 輪詢或合成 #${taskId} 異常:`, error.message);
+        }
     }
-    if ((!resultA || !resultB) && resultA !== "FAILED" && resultB !== "FAILED") {
-        console.log(`⏳ 號碼牌 #${taskId} 已等待超過 360 秒（6分鐘），官方可能塞車，轉交手動後台接手。`);
+
+    if ((!resultA || !resultB) && resultA !== 'FAILED' && resultB !== 'FAILED') {
+        console.log(`⏳ 號碼牌 #${taskId} 已等待超過 360 秒，轉交後台手動處理。`);
     }
 }
 
@@ -261,7 +428,14 @@ app.post('/api/upload', async (req, res) => {
 });
 
 app.get('/health', (_req, res) => {
-    res.json({ success: true, booth: 'B', scenes: Object.keys(SCENES), firebase: useFirebase });
+    res.json({
+        success: true,
+        booth: 'B',
+        layeredComposite: true,
+        removeBgMode: REMOVE_BG_MODE,
+        scenes: Object.keys(SCENES),
+        firebase: useFirebase
+    });
 });
 
 app.get('/api/status/:taskId', async (req, res) => {
