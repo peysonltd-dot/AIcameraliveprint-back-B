@@ -81,6 +81,37 @@ function removeChroma(data,w,h,border,keyInfo,diagnostics) {
     diagnostics.method='adaptive-chroma';
 }
 
+// Remove strongly saturated magenta contamination only in a narrow band beside exterior transparency.
+// Interior pink artwork stays untouched. This also handles an uploaded PNG that already has alpha.
+function cleanAlphaFringe(data,w,h,diagnostics) {
+    const n=w*h,original=Buffer.from(data),border=borders(w,h);
+    const exterior=flood(w,h,border,i=>original[i*4+3]<8);
+    const band=Math.max(3,Math.min(6,Math.round(Math.min(w,h)/160))),depth=band+3;
+    const dist=new Uint8Array(n),queue=new Int32Array(n);let head=0,tail=0;
+    const pink=i=>{const p=i*4,r=original[p],g=original[p+1],b=original[p+2],t=hsv(r,g,b);return t[0]>=285&&t[0]<=340&&t[1]>.5&&r-g>40&&b-g>40;};
+    for(let i=0;i<n;i++)if(exterior[i]) {
+        const x=i%w,y=Math.floor(i/w);
+        if((x&&!exterior[i-1])||(x<w-1&&!exterior[i+1])||(y&&!exterior[i-w])||(y<h-1&&!exterior[i+w]))queue[tail++]=i;
+    }
+    while(head<tail){const i=queue[head++];if(dist[i]>=depth)continue;const x=i%w,y=Math.floor(i/w);
+        for(const j of [x?i-1:-1,x<w-1?i+1:-1,y?i-w:-1,y<h-1?i+w:-1])if(j>=0&&!exterior[j]&&!dist[j]){dist[j]=dist[i]+1;queue[tail++]=j;}
+    }
+    let corrected=0,unresolved=0;
+    for(let i=0;i<n;i++)if(!exterior[i]&&dist[i]>0&&dist[i]<=band&&pink(i)) {
+        const x=i%w,y=Math.floor(i/w),p=i*4;let best=-1,bestDistance=Infinity;
+        for(let dy=-depth;dy<=depth;dy++)for(let dx=-depth;dx<=depth;dx++) {
+            if(x+dx<0||x+dx>=w||y+dy<0||y+dy>=h)continue;
+            const j=(y+dy)*w+x+dx,d=dx*dx+dy*dy;
+            if(d>=bestDistance||exterior[j]||original[j*4+3]<180||pink(j)||(dist[j]&&dist[j]<=dist[i]))continue;
+            best=j;bestDistance=d;
+        }
+        if(best>=0){for(let c=0;c<3;c++)data[p+c]=original[best*4+c];corrected++;}
+        else unresolved++;
+    }
+    diagnostics.fringePixelsCorrected=corrected;
+    if(unresolved>8)diagnostics.warning=[diagnostics.warning,'部分色邊仍需工作人員檢查'].filter(Boolean).join('；');
+}
+
 async function preparePrintPng(buffer,{width=1024,height=768,margin=.08,diagnostics={}}={}) {
     const {data,info}=await sharp(buffer,{limitInputPixels:20000000}).rotate().ensureAlpha().raw().toBuffer({resolveWithObject:true});
     const w=info.width,h=info.height,n=w*h,border=borders(w,h);
@@ -94,11 +125,14 @@ async function preparePrintPng(buffer,{width=1024,height=768,margin=.08,diagnost
             const paper=[med(0),med(1),med(2)];
             const delta=i=>Math.hypot(data[i*4]-paper[0],data[i*4+1]-paper[1],data[i*4+2]-paper[2]);
             if(Math.min(...paper)<210||border.filter(i=>delta(i)<24).length/border.length<.95)throw Error('外圍背景不是可辨識的單一底色，需要人工去背');
-            const mask=flood(w,h,border,i=>delta(i)<=32);
-            for(let i=0;i<n;i++)if(mask[i])data[i*4+3]=Math.min(data[i*4+3],Math.round(clamp((delta(i)-14)/18)*255));
-            diagnostics.method='paper';diagnostics.warning='已使用淺色背景備援去背，請確認白色角色、衣物與水花邊緣';
+            const mask=flood(w,h,border,i=>delta(i)<=10);
+            for(let i=0;i<n;i++)if(mask[i])data[i*4+3]=Math.min(data[i*4+3],Math.round(clamp((delta(i)-3)/7)*255));
+            diagnostics.method='paper';diagnostics.warning='白底已做外圍去背，請確認白色角色、衣物、水花及封閉空隙；白色與背景相連的細節可能無法區分';
         }
     }
+    // White/native-alpha artwork must not undergo magenta color replacement.
+    // Keep legacy chroma handling for old generated originals.
+    if(diagnostics.method==='adaptive-chroma')cleanAlphaFringe(data,w,h,diagnostics);
     if(border.some(i=>data[i*4+3]>24))throw Error('圖案碰到原圖邊界，可能已裁切，請重新生成完整構圖');
     let left=w,top=h,right=-1,bottom=-1,count=0;
     for(let i=0;i<n;i++)if(data[i*4+3]>0){const x=i%w,y=Math.floor(i/w);left=Math.min(left,x);right=Math.max(right,x);top=Math.min(top,y);bottom=Math.max(bottom,y);count++;}

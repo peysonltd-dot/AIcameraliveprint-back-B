@@ -25,7 +25,7 @@ let useFirebase = false;
 
 const appId = (process.env.APP_ID || "photo-booth-app").trim();
 const LEONARDO_API_KEY = (process.env.LEONARDO_API_KEY || "").trim();
-const REMOVE_BG_MODE = "local-chroma";
+const REMOVE_BG_MODE = "local-white";
 const OUTPUT_WIDTH = 1024;
 const OUTPUT_HEIGHT = 768;
 const PRINT_MARGIN = 0.08;
@@ -167,8 +167,8 @@ function fullScenePrompt(scene, watercolor) {
         watercolor
             ? 'GUEST STYLE: customer watercolor illustration, approximately four-head-tall proportions, natural smiling eyes, recognizable face, fine ink outlines, soft watercolor shading and light paper grain. Avoid photographic skin and oversized black chibi eyes.'
             : 'GUEST STYLE: super cute minimalist hand-drawn chibi, approximately 2.5-head-tall proportions, a large round head, simple oval black eyes, tiny nose and mouth, rosy cheeks, textured crayon outlines, compact limbs and flat colors. Not realistic adult proportions.',
-        'PRINT CUTOUT COMPOSITION: the artwork is one complete island of guest, selected mascot, boat, blue/aqua water and water splashes. Retain blue water and solid white foam as part of the drawing. Outside that cluster use ONLY uniform pure magenta #FF00FF with no paper, rectangular color wash, gradient, scenery or shadow. The magenta will be removed by software. Never use that exact key color inside the artwork.',
-        'ZOOM OUT. Leave at least 12 percent clear magenta margin on ALL FOUR SIDES, including around stray droplets, ears, hats, staff, telescope, hair and the bottommost wave. Fit the ENTIRE artwork within the central 76 percent of the canvas. Nothing may touch the image boundary. Never crop the boat, head, mascot accessories or splashes. Keep the camera perspective harmonious and both figures seated inside the hull.',
+        'PRINT CUTOUT COMPOSITION: the artwork is one complete island of guest, selected mascot, boat, blue/aqua water and water splashes. Retain blue water and solid white foam as part of the drawing. Outside that cluster use ONLY uniform pure white #FFFFFF with no paper texture, rectangular color wash, gradient, scenery, shadow or checkerboard. Do not add a pink or magenta backdrop, glow or outline. Keep the original white mascot regions, white clothing and solid white foam; distinguish their outer edges from the white backdrop with the existing subtle illustration outlines. Do not recolor white artwork to make the background removable.',
+        'ZOOM OUT. Leave at least 12 percent clear white margin on ALL FOUR SIDES, including around stray droplets, ears, hats, staff, telescope, hair and the bottommost wave. Fit the ENTIRE artwork within the central 76 percent of the canvas. Nothing may touch the image boundary. Never crop the boat, head, mascot accessories or splashes. Keep the camera perspective harmonious and both figures seated inside the hull.',
         'Exactly one human, one selected mascot from reference 2 and one boat. Do not include the green example mascot unless the selected reference 2 is green. No extra mascot, boat, chair, duplicate limb, pasted-on portrait, collage border, caption, invented lettering or event logo. Keep important characters and the hull within the 4:3 landscape frame.',
         'Final visual priority: recognizable guest; faithful official mascot and boat designs; natural shared seating and shoulder interaction; consistent overall illustration.'
     ].join(' ');
@@ -313,7 +313,7 @@ app.get('/health', (_req, res) => {
     res.json({
         success: true,
         booth: 'B',
-        pipelineVersion: 'leonardo-chibi-print-v10',
+        pipelineVersion: 'leonardo-chibi-print-v13',
         imageProvider: 'leonardo-full-scene',
         imageProviderConfigured: !!LEONARDO_API_KEY,
         modelSideMask: false,
@@ -341,7 +341,8 @@ app.post('/api/choice/:taskId', async (req, res) => {
     if (!task) return res.status(404).json({ error: '找不到該任務' });
     if (!['A','B'].includes(choice) || !task[`resultImage${choice}`]) return res.status(400).json({ error: '這款圖片尚未完成，請選擇已完成的款式' });
     if (task.styleMode === 'chibi-only' && choice !== 'B') return res.status(400).json({ error: '請確認本次合影' });
-    if (task[`printStatus${choice}`] !== 'ready' || task.reprocessing) return res.status(409).json({ error: '合影需由工作人員確認後才能送出' });
+    if (task.reprocessing || task.status === 'pending') return res.status(409).json({ error: '圖片仍在處理中，請稍候再送出' });
+    // Guest confirmation does not certify print quality; preserve printStatus and warnings for staff.
     task.chosenDesign = choice;
     triggerFeiePrint(task);
     if (useFirebase) await updateDoc(doc(db, 'artifacts', appId, 'public', taskId), { chosenDesign: choice });
