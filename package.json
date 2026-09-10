@@ -1,7 +1,7 @@
 {
   "name": "ai-photo-booth-backend",
   "version": "1.0.0",
-  "description": "AI Photo Booth Backend using Replicate and Firebase Firestore",
+  "description": "B booth Leonardo watercolor and chibi portraits with official IP layers",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -14,6 +14,6 @@
     "sharp": "^0.35.4"
   },
   "engines": {
-    "node": ">=18.17.0"
+    "node": ">=22"
   }
 }

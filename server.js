@@ -25,26 +25,21 @@ let useFirebase = false;
 
 const appId = (process.env.APP_ID || "photo-booth-app").trim();
 const LEONARDO_API_KEY = (process.env.LEONARDO_API_KEY || "").trim();
-const REMOVE_BG_MODE = (process.env.REMOVE_BG_MODE || "local").trim().toLowerCase();
+const REMOVE_BG_MODE = "none"; // v7: 整張合影生成，不去背、不做人物圖層合成。
 const OUTPUT_WIDTH = 1024;
 const OUTPUT_HEIGHT = 768;
 const SCENES = {
     "digital-ark-green": {
         name: "與綠色 IP 共乘數位方舟",
-        referencePath: path.join(__dirname, "assets", "layers", "digital-ark-green", "pose-reference.jpg"),
+        referencePath: path.join(__dirname, "assets", "test-scene-reference.jpg"),
         backgroundPath: path.join(__dirname, "assets", "layers", "digital-ark-green", "background.svg"),
         ipPath: path.join(__dirname, "assets", "layers", "digital-ark-green", "ip.svg"),
         boatPath: path.join(__dirname, "assets", "layers", "digital-ark-green", "boat.svg"),
-        ipLayout: { height: 520, left: 565, top: 72 },
-        personSourceSafeArea: { width: 590, height: 875, left: 190, top: 75 },
-        personCanvas: { width: 650, height: 650, left: 0, top: 38 },
-        boatLayout: { width: 920, left: 52, top: 290 },
-        composition: "Create one isolated chibi guest sitting on the front-left rim of an invisible boat. Show the complete character from head through the seated hips, both arms and both bent legs; never crop the body into a bust portrait. The guest faces the camera with the torso angled slightly toward the companion on the viewer's right. The right hand makes one simple friendly wave toward that companion; the left hand rests naturally near the bent knee. Keep the exact placement and scale of the pose reference."
+        composition: "One photographed guest on the left and exactly one official green mascot on the right sit TOGETHER INSIDE ONE digital ark boat. The guest faces the camera, leans toward the mascot and gently places an arm around its far shoulder. Integrate both bodies into the same cockpit, with the hull naturally occluding their lower bodies. Keep the full face and a meaningful part of the upper torso visible. Natural arm and hand anatomy; no limbs hanging outside, no second boat or pasted-on portrait."
     }
 };
 const Q_STYLE_REFERENCE_PATH = path.join(__dirname, "assets", "q-style-reference.jpg");
-const sceneReferenceCache = new Map();
-let qStyleReferenceCache = null;
+const referenceCache = new Map();
 
 // Firebase 初始化 (僅在開機時連線一次)
 if (process.env.FIREBASE_CONFIG) {
@@ -112,359 +107,178 @@ async function triggerFeiePrint(task) {
     } catch (err) {}
 }
 
-async function uploadBufferToLeonardoS3(imageBuffer, label = 'image') {
-    try {
-        const initUploadRes = await fetch('https://cloud.leonardo.ai/api/rest/v1/init-image', {
-            method: 'POST', headers: { 'accept': 'application/json', 'authorization': `Bearer ${LEONARDO_API_KEY}`, 'content-type': 'application/json' },
-            body: JSON.stringify({ "extension": "jpg" })
-        });
-        if (!initUploadRes.ok) throw new Error(await initUploadRes.text());
-
-        const uploadData = await initUploadRes.json();
-        const { id, url, fields } = uploadData.uploadInitImage;
-        const formData = new FormData();
-        Object.entries(JSON.parse(fields)).forEach(([key, value]) => { formData.append(key, value); });
-        formData.append('file', new Blob([imageBuffer], { type: 'image/jpeg' }), 'image.jpg');
-
-        const s3UploadRes = await fetch(url, { method: 'POST', body: formData });
-        if (s3UploadRes.status >= 200 && s3UploadRes.status < 300) {
-            console.log(`✅ ${label}成功上傳 Leonardo S3，ID: ${id}`); return id;
-        } else { throw new Error(`S3 上傳失敗: ${s3UploadRes.status}`); }
-    } catch (err) { throw err; }
+function decodePhoto(value) {
+    const match = /^data:image\/(?:jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=\r\n]+)$/.exec(value || '');
+    if (!match) throw new Error('請提供 JPG、PNG 或 WebP 照片');
+    return Buffer.from(match[1], 'base64');
 }
-
-async function uploadToLeonardoS3(base64Image) {
-    const imageBuffer = Buffer.from(base64Image.replace(/^data:image\/\w+;base64,/, ""), 'base64');
-    return uploadBufferToLeonardoS3(imageBuffer, '客人照片');
+async function uploadBufferToLeonardoS3(buffer) {
+    const headers = { authorization: `Bearer ${LEONARDO_API_KEY}`, 'content-type': 'application/json' };
+    const response = await fetch('https://cloud.leonardo.ai/api/rest/v1/init-image', {
+        method: 'POST', headers, signal: AbortSignal.timeout(30000), body: JSON.stringify({ extension: 'jpg' })
+    });
+    if (!response.ok) throw new Error(`Leonardo 上傳初始化失敗：${response.status}`);
+    const { uploadInitImage } = await response.json();
+    const { id, url, fields } = uploadInitImage || {};
+    if (!id || !url || !fields) throw new Error('Leonardo 未回傳上傳位置');
+    const form = new FormData();
+    Object.entries(typeof fields === 'string' ? JSON.parse(fields) : fields).forEach(([key,value]) => form.append(key,value));
+    form.append('file', new Blob([buffer], { type: 'image/jpeg' }), 'reference.jpg');
+    const uploaded = await fetch(url, { method: 'POST', body: form, signal: AbortSignal.timeout(60000) });
+    if (!uploaded.ok) throw new Error(`參考圖上傳失敗：${uploaded.status}`);
+    return id;
 }
-
-async function getSceneReferenceId(sceneId) {
-    if (sceneReferenceCache.has(sceneId)) return sceneReferenceCache.get(sceneId);
-    const scene = SCENES[sceneId];
-    if (!scene) throw new Error(`未知的互動情境：${sceneId}`);
-    const referenceBuffer = fs.readFileSync(scene.referencePath);
-    const referenceId = await uploadBufferToLeonardoS3(referenceBuffer, `情境參考圖「${scene.name}」`);
-    sceneReferenceCache.set(sceneId, referenceId);
-    return referenceId;
-}
-
-async function getQStyleReferenceId() {
-    if (qStyleReferenceCache) return qStyleReferenceCache;
-    const referenceBuffer = fs.readFileSync(Q_STYLE_REFERENCE_PATH);
-    qStyleReferenceCache = await uploadBufferToLeonardoS3(referenceBuffer, 'Q 版畫風參考圖');
-    return qStyleReferenceCache;
-}
-
-async function downloadImageBuffer(url, label = '圖片') {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`${label}下載失敗：${response.status}`);
+async function downloadImageBuffer(url) {
+    const response = await fetch(url, { signal: AbortSignal.timeout(30000) });
+    if (!response.ok) throw new Error(`圖片下載失敗：${response.status}`);
     return Buffer.from(await response.arrayBuffer());
 }
 
-async function removeBackgroundWithLeonardo(imageUrl) {
-    const response = await fetch('https://cloud.leonardo.ai/api/rest/v2/generationssync', {
-        method: 'POST',
-        headers: { 'accept': 'application/json', 'authorization': `Bearer ${LEONARDO_API_KEY}`, 'content-type': 'application/json' },
-        body: JSON.stringify({
-            model: 'remove-bg', public: false, ephemeral: true, base64: true,
-            parameters: {
-                size: 'auto', type: 'graphic', channels: 'rgba', format: 'png', crop: false,
-                semitransparency: true, shadow_type: 'none', quantity: 1,
-                guidances: { image_reference: [{ image: { url: imageUrl, type: 'URL' } }] }
-            }
-        })
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || data.message || `Leonardo 去背失敗：${response.status}`);
-    const encoded = data.results?.[0]?.dataB64;
-    if (!encoded) throw new Error('Leonardo 去背沒有回傳圖片');
-    return Buffer.from(encoded.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+async function artworkReference(file) {
+    // Rasterize the supplied vector without distorting its proportions.
+    return sharp(file, { density: 144 }).resize(1024, 1024, { fit: 'contain', background: '#ffffff' })
+        .flatten({ background: '#ffffff' }).jpeg({ quality: 95 }).toBuffer();
 }
-
-async function removeMagentaBackgroundLocally(imageBuffer) {
-    const { data, info } = await sharp(imageBuffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
-    const { width, height, channels } = info;
-    const pixelCount = width * height;
-    const visited = new Uint8Array(pixelCount);
-    const queue = new Int32Array(pixelCount);
-    let head = 0;
-    let tail = 0;
-
-    const distanceFromKey = (pixelIndex) => {
-        const offset = pixelIndex * channels;
-        const redDelta = 255 - data[offset];
-        const greenDelta = data[offset + 1];
-        const blueDelta = 255 - data[offset + 2];
-        return Math.sqrt(redDelta * redDelta + greenDelta * greenDelta + blueDelta * blueDelta);
+async function finalizeFullScene(buffer) {
+    // The provider returns the WHOLE finished scene. No chroma key, cutout, mask or overlay.
+    const result = await sharp(buffer).rotate().resize(OUTPUT_WIDTH, OUTPUT_HEIGHT, {
+        fit: 'contain', background: '#fffdf8'
+    }).flatten({ background: '#fffdf8' }).jpeg({ quality: 92, chromaSubsampling: '4:4:4' }).toBuffer();
+    return `data:image/jpeg;base64,${result.toString('base64')}`;
+}
+function fullScenePrompt(scene, watercolor) {
+    return [
+        'Create ONE complete finished event illustration. Redraw the guest, the official mascot, the boat and the background together as a coherent scene, NOT as separate cutout stickers.',
+        'REFERENCE PRIORITY: Reference 1 is the photographed guest and the ONLY human identity source. Preserve recognizable hairstyle, hair color, face shape, glasses, clothing colors and accessories. Never copy the person in any other reference.',
+        'Reference 2 is the AUTHORITATIVE OFFICIAL MASCOT DESIGN. Faithfully reproduce its silhouette, body proportions, ear shapes, face and mouth shapes, eye positions, exact green and cream color regions, cheek placement, tablet and other original accessories. Do not redesign, humanize, add costume, hat, extra ears, fingers or a new face. Keep its original visual identity even when adapting the guest drawing style.',
+        'Reference 3 is the AUTHORITATIVE BOAT DESIGN: retain the hull silhouette, teal/navy/cream/orange/yellow palette, circuit motifs, front emblem and rail arrangement. Exactly ONE boat in the entire image.',
+        'Reference 4 is COMPOSITION and atmosphere ONLY: a close, friendly shared ride with a visible smiling guest. Ignore its sample human identity and any altered mascot, hat, logo or accessory. Where it conflicts with reference 2 or 3, the official reference 2 or 3 ALWAYS takes priority.',
+        'Reference 5 is GUEST DRAWING STYLE ONLY: never copy its identity, clothing, props, mascot or text.',
+        scene.composition,
+        watercolor
+            ? 'GUEST STYLE: customer watercolor illustration, approximately four-head-tall proportions, natural smiling eyes, recognizable face, fine ink outlines, soft watercolor shading and light paper grain. Avoid photographic skin and oversized black chibi eyes.'
+            : 'GUEST STYLE: super cute minimalist hand-drawn chibi, approximately 2.5-head-tall proportions, a large round head, simple oval black eyes, tiny nose and mouth, rosy cheeks, textured crayon outlines, compact limbs and flat colors. Not realistic adult proportions.',
+        'Use a harmonious light cream and pale aqua illustrated background, subtle water splashes around the single boat, consistent perspective and lighting. Adapt the composition to the guest proportions so they sit naturally inside the cockpit. Never cover the guest face with the hull.',
+        'Exactly one human, one official green mascot and one boat. No extra mascot, boat, chair, duplicate limb, floating cutout, magenta background, collage border, caption, invented lettering or event logo. Keep important characters and the hull within the 4:3 landscape frame.',
+        'Final visual priority: recognizable guest; faithful official mascot and boat designs; natural shared seating and shoulder interaction; consistent overall illustration.'
+    ].join(' ');
+}
+async function getReference(key, makeBuffer) {
+    if (!referenceCache.has(key)) referenceCache.set(key,
+        makeBuffer().then(uploadBufferToLeonardoS3).catch(error => { referenceCache.delete(key); throw error; }));
+    return referenceCache.get(key);
+}
+function leonardoPayload(model, prompt, ids) {
+    const parameters = {
+        width: OUTPUT_WIDTH, height: OUTPUT_HEIGHT, quantity: 1, prompt, prompt_enhance: 'OFF',
+        guidances: { image_reference: ids.map((id, i) => ({
+            image: { id, type: 'UPLOADED' },
+            ...(model === 'gemini-2.5-flash-image' ? { strength: i === 3 ? 'LOW' : i === 4 ? 'MID' : 'HIGH' } : {})
+        })) }
     };
-    const enqueueIfBackground = (pixelIndex) => {
-        if (visited[pixelIndex] || distanceFromKey(pixelIndex) > 190) return;
-        visited[pixelIndex] = 1;
-        queue[tail++] = pixelIndex;
-    };
-
-    for (let x = 0; x < width; x++) {
-        enqueueIfBackground(x);
-        enqueueIfBackground((height - 1) * width + x);
-    }
-    for (let y = 1; y < height - 1; y++) {
-        enqueueIfBackground(y * width);
-        enqueueIfBackground(y * width + width - 1);
-    }
-
-    while (head < tail) {
-        const index = queue[head++];
-        const x = index % width;
-        const y = Math.floor(index / width);
-        if (x > 0) enqueueIfBackground(index - 1);
-        if (x + 1 < width) enqueueIfBackground(index + 1);
-        if (y > 0) enqueueIfBackground(index - width);
-        if (y + 1 < height) enqueueIfBackground(index + width);
-    }
-
-    for (let index = 0; index < pixelCount; index++) {
-        if (!visited[index]) continue;
-        const distance = distanceFromKey(index);
-        const alpha = distance <= 70 ? 0 : Math.round(Math.min(1, (distance - 70) / 120) * 255);
-        data[index * channels + 3] = alpha;
-    }
-
-    // 保留原始 1024×1024 座標；不可裁切後再自動放大，否則人物會偏位或只剩頭部。
-    return sharp(data, { raw: info }).png().toBuffer();
+    if (model === 'gpt-image-2') parameters.quality = 'LOW';
+    return { model, public: false, parameters };
 }
-
-async function createPersonCutout(imageUrl) {
-    if (REMOVE_BG_MODE === 'leonardo') {
-        try {
-            return await removeBackgroundWithLeonardo(imageUrl);
-        } catch (error) {
-            console.error(`⚠️ Leonardo 去背失敗，改用本機備援：${error.message}`);
-        }
-    }
-    const imageBuffer = await downloadImageBuffer(imageUrl, 'AI 人物圖');
-    return removeMagentaBackgroundLocally(imageBuffer);
-}
-
-async function resizeSvgLayer(filePath, options) {
-    return sharp(filePath, { density: 216 }).resize(options).png().toBuffer();
-}
-
-async function normalizePersonToPoseCanvas(scene, personCutout) {
-    const trimmed = await sharp(personCutout)
-        .ensureAlpha()
-        .trim({ background: { r: 0, g: 0, b: 0, alpha: 0 }, threshold: 12 })
-        .png()
-        .toBuffer({ resolveWithObject: true });
-
-    if (trimmed.info.width > 995 && trimmed.info.height > 995) {
-        throw new Error('人物去背未成功，無法進行固定座位合成');
-    }
-
-    const safeArea = scene.personSourceSafeArea;
-    const normalizedSubject = await sharp(trimmed.data)
-        .resize({
-            width: safeArea.width,
-            height: safeArea.height,
-            fit: 'contain',
-            position: 'top',
-            withoutEnlargement: false,
-            background: { r: 0, g: 0, b: 0, alpha: 0 }
-        })
-        .png()
-        .toBuffer();
-
-    return sharp({
-        create: {
-            width: 1024,
-            height: 1024,
-            channels: 4,
-            background: { r: 0, g: 0, b: 0, alpha: 0 }
-        }
-    })
-        .composite([{ input: normalizedSubject, left: safeArea.left, top: safeArea.top }])
-        .png()
-        .toBuffer();
-}
-
-async function compositeFixedScene(scene, personCutout) {
-    const normalizedPersonCanvas = await normalizePersonToPoseCanvas(scene, personCutout);
-    const [ipLayer, boatLayer, personLayer] = await Promise.all([
-        resizeSvgLayer(scene.ipPath, { height: scene.ipLayout.height, fit: 'inside' }),
-        resizeSvgLayer(scene.boatPath, { width: scene.boatLayout.width, fit: 'inside' }),
-        sharp(normalizedPersonCanvas).resize({
-            width: scene.personCanvas.width,
-            height: scene.personCanvas.height,
-            fit: 'contain',
-            position: 'centre',
-            background: { r: 0, g: 0, b: 0, alpha: 0 }
-        }).png().toBuffer()
-    ]);
-
-    const finalBuffer = await sharp(scene.backgroundPath, { density: 144 })
-        .resize(OUTPUT_WIDTH, OUTPUT_HEIGHT)
-        .composite([
-            { input: ipLayer, left: scene.ipLayout.left, top: scene.ipLayout.top },
-            { input: boatLayer, left: scene.boatLayout.left, top: scene.boatLayout.top },
-            // 人物坐在船緣上方，不再被整艘船遮到只剩頭；人物畫布本身就是安全區。
-            { input: personLayer, left: scene.personCanvas.left, top: scene.personCanvas.top }
-        ])
-        .flatten({ background: '#fffdf8' })
-        .jpeg({ quality: 90, chromaSubsampling: '4:4:4' })
-        .toBuffer();
-
-    return `data:image/jpeg;base64,${finalBuffer.toString('base64')}`;
-}
-
-async function finalizeGeneratedPerson(sceneId, imageUrl) {
-    const scene = SCENES[sceneId];
-    if (!scene) throw new Error(`未知的互動情境：${sceneId}`);
-    const cutout = await createPersonCutout(imageUrl);
-    return compositeFixedScene(scene, cutout);
-}
-
-async function requestLeonardoGeneration(model, styleId, prompt, guestImageId, sceneReferenceId, qStyleReferenceId) {
+async function requestGeneration(payload) {
+    // Billable POSTs are never retried automatically, including unknown timeout outcomes.
     const response = await fetch('https://cloud.leonardo.ai/api/rest/v2/generations', {
-        method: 'POST',
-        headers: { 'accept': 'application/json', 'authorization': `Bearer ${LEONARDO_API_KEY}`, 'content-type': 'application/json' },
-        body: JSON.stringify({
-            model, public: false,
-            parameters: {
-                height: 1024, width: 1024, prompt_enhance: "OFF", quantity: 1, quality: "LOW",
-                style_ids: [styleId], prompt,
-                guidances: {
-                    image_reference: [
-                        { image: { id: guestImageId, type: "UPLOADED" }, strength: "MID" },
-                        { image: { id: sceneReferenceId, type: "UPLOADED" }, strength: "HIGH" },
-                        { image: { id: qStyleReferenceId, type: "UPLOADED" }, strength: "HIGH" }
-                    ]
-                }
-            }
-        })
+        method: 'POST', signal: AbortSignal.timeout(90000),
+        headers: { authorization: `Bearer ${LEONARDO_API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify(payload)
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || data.message || `Leonardo 生圖請求失敗：${response.status}`);
-    return data.generate?.generationId || data.generationId || data.sdGenerationJob?.generationId;
+    if (!response.ok) throw new Error(data.message || `Leonardo 生圖請求失敗：${response.status}`);
+    const id = data.generate?.generationId || data.generationId || data.sdGenerationJob?.generationId;
+    if (!id) throw new Error('Leonardo 未回傳任務 ID，請查詢帳戶紀錄再重試');
+    return id;
 }
-
-async function generateLeonardoDualStyles(taskId, base64Image, sceneId) {
-    try {
-        const scene = SCENES[sceneId];
-        if (!scene) throw new Error(`未知的互動情境：${sceneId}`);
-        const guestImageId = await uploadToLeonardoS3(base64Image);
-        const sceneReferenceId = await getSceneReferenceId(sceneId);
-        const qStyleReferenceId = await getQStyleReferenceId();
-        console.log(`⚡ 啟動「${scene.name}」雙模型 Q 版人物生成，完成後再固定分層合成...`);
-
-        const identityRules = "Reference 1 is the photographed guest and is the only identity reference. Preserve recognizable cues from the guest: hairstyle, hair color, glasses, clothing colors and accessories, but do not render a realistic adult face. Reference 2 is strict full-canvas pose and placement guidance only: keep the smaller head, complete seated torso, raised right hand and two bent legs in the same coordinates, without copying its gray colors. Reference 3 is style only: copy its cute chibi proportions, simple facial language, textured outline and flat coloring, but never copy that reference person's identity, hairstyle, glasses or clothing.";
-        const isolationRules = "Generate exactly one isolated human guest and show the complete seated character, never a bust portrait or head-only portrait. Keep the character inside the left 75 percent of the square canvas and leave the right side clear for a fixed mascot added later. Do not generate any mascot, animal, boat, vehicle, scenery, prop, logo, letters or extra person. Use one perfectly uniform solid pure magenta #FF00FF background from edge to edge, with no texture, gradient, shadow or floor. Keep clear margin around the complete character. Hands must be small, simple and anatomically clean, with no extra fingers or duplicated limbs.";
-        const promptA = `${identityRules} ${scene.composition} ${isolationRules} Transform the guest into an unmistakably super-cute chibi character with a very large round head, tiny compact body, about 2.5 heads tall, big simple oval black eyes, tiny nose and mouth, rosy cheeks, short simplified limbs, slightly thick hand-drawn crayon outlines, flat clean colors and almost no realistic shading. Match the original cute avatar style, not anime realism, watercolor portrait realism or photographic skin.`;
-        const promptB = `${identityRules} ${scene.composition} ${isolationRules} Transform the guest into a recognizable chibi character about 3 heads tall. Keep more of the guest's face shape and personal features than version A while still using a large head, compact body, simple oval eyes, small nose and mouth, rosy cheeks, textured hand-drawn outlines, controlled flat colors and light paper texture. Match the original cute avatar style; avoid realistic facial rendering, realistic skin pores, long adult proportions and semi-photorealistic watercolor.`;
-
-        const [genIdA, genIdB] = await Promise.all([
-            requestLeonardoGeneration("gemini-2.5-flash-image", "6fedbf1f-4a17-45ec-84fb-92fe524a29ef", promptA, guestImageId, sceneReferenceId, qStyleReferenceId),
-            requestLeonardoGeneration("gpt-image-2", "645e4195-f63d-4715-a3f2-3fb1e6eb8c70", promptB, guestImageId, sceneReferenceId, qStyleReferenceId)
-        ]);
-
-        if (!genIdA || !genIdB) { throw new Error("無法取得官方任務 ID。"); }
-
-        console.log(`🎯 Leonardo 雙模生圖已在背景啟動！Job A: ${genIdA} | Job B: ${genIdB}`);
-        pollAndSaveResults(taskId, genIdA, genIdB);
-
-    } catch (err) {
-        console.error(`❌ 自動化生圖失敗 (#${taskId}):`, err.message);
-        if (localTasksCache[taskId]) {
-            localTasksCache[taskId].remark = `失敗: ${err.message}`;
-            if (useFirebase) updateDoc(doc(db, 'artifacts', appId, 'public', taskId), { remark: localTasksCache[taskId].remark });
-        }
-    }
+async function saveGenerationState(task) {
+    if (useFirebase) await updateDoc(doc(db, 'artifacts', appId, 'public', task.id), {
+        status: task.status, remark: task.remark,
+        generationIdA: task.generationIdA || null, generationIdB: task.generationIdB || null,
+        resultImageA: task.resultImageA, resultImageB: task.resultImageB
+    }).catch(error => console.error('生成資料雲端同步失敗:', error.message));
 }
-
-async function pollAndSaveResults(taskId, genIdA, genIdB) {
-    let resultA = null;
-    let resultB = null;
-    let rawUrlA = null;
-    let rawUrlB = null;
-    let attempts = 0;
-    const maxAttempts = 180;
-    const sceneId = localTasksCache[taskId]?.sceneId || 'digital-ark-green';
-
-    while (attempts < maxAttempts && (!resultA || !resultB)) {
+async function runStyle(task, guestId, styleKey) {
+    const scene = SCENES[task.sceneId];
+    const watercolor = styleKey === 'watercolor';
+    const suffix = watercolor ? 'A' : 'B';
+    const [ipId, boatId, compositionId, styleId] = await Promise.all([
+        getReference(`${task.sceneId}-official-ip-v7`, () => artworkReference(scene.ipPath)),
+        getReference(`${task.sceneId}-official-boat-v7`, () => artworkReference(scene.boatPath)),
+        getReference(`${task.sceneId}-composition-v7`, () => fs.promises.readFile(scene.referencePath)),
+        getReference(`guest-style-${styleKey}-v7`, async () => watercolor
+            ? sharp(scene.referencePath).extract({ left: 105, top: 0, width: 430, height: 455 })
+                .resize(768, 768, { fit: 'contain', background: '#fffdf8' }).jpeg({ quality: 92 }).toBuffer()
+            : fs.promises.readFile(Q_STYLE_REFERENCE_PATH))
+    ]);
+    const prompt = fullScenePrompt(scene, watercolor);
+    const id = await requestGeneration(leonardoPayload(watercolor ? 'gemini-2.5-flash-image' : 'gpt-image-2', prompt,
+        [guestId, ipId, boatId, compositionId, styleId]));
+    task[`generationId${suffix}`] = id;
+    await saveGenerationState(task);
+    const deadline = Date.now() + 360000;
+    while (Date.now() < deadline) {
         await new Promise(resolve => setTimeout(resolve, 2000));
-        attempts++;
+        let response;
         try {
-            if (!rawUrlA && resultA !== 'FAILED') {
-                const resA = await fetch(`https://cloud.leonardo.ai/api/rest/v1/generations/${genIdA}`, { headers: { 'authorization': `Bearer ${LEONARDO_API_KEY}` } }).then(response => response.json());
-                const jobA = resA.generations_by_pk;
-                if (attempts === 1 || attempts % 5 === 0) console.log(`🔍 [進度轉播] #${taskId} 超 Q 人物狀態: ${jobA?.status || JSON.stringify(resA)}`);
-                if (jobA?.status === 'COMPLETE' && jobA.generated_images?.length > 0) rawUrlA = jobA.generated_images[0].url;
-                if (jobA?.status === 'FAILED') resultA = 'FAILED';
-            }
-
-            if (!rawUrlB && resultB !== 'FAILED') {
-                const resB = await fetch(`https://cloud.leonardo.ai/api/rest/v1/generations/${genIdB}`, { headers: { 'authorization': `Bearer ${LEONARDO_API_KEY}` } }).then(response => response.json());
-                const jobB = resB.generations_by_pk;
-                if (attempts === 1 || attempts % 5 === 0) console.log(`🔍 [進度轉播] #${taskId} 相似 Q 人物狀態: ${jobB?.status || JSON.stringify(resB)}`);
-                if (jobB?.status === 'COMPLETE' && jobB.generated_images?.length > 0) rawUrlB = jobB.generated_images[0].url;
-                if (jobB?.status === 'FAILED') resultB = 'FAILED';
-            }
-
-            const finalizationJobs = [];
-            if (rawUrlA && !resultA) {
-                finalizationJobs.push(finalizeGeneratedPerson(sceneId, rawUrlA).then(image => {
-                    resultA = image;
-                    localTasksCache[taskId].resultImageA = image;
-                    console.log(`✅ #${taskId} 超 Q 版已完成去背與固定 IP 分層合成`);
-                }));
-            }
-            if (rawUrlB && !resultB) {
-                finalizationJobs.push(finalizeGeneratedPerson(sceneId, rawUrlB).then(image => {
-                    resultB = image;
-                    localTasksCache[taskId].resultImageB = image;
-                    console.log(`✅ #${taskId} 相似 Q 版已完成去背與固定 IP 分層合成`);
-                }));
-            }
-            if (finalizationJobs.length > 0) await Promise.all(finalizationJobs);
-
-            if (resultA && resultB && resultA !== 'FAILED' && resultB !== 'FAILED') {
-                localTasksCache[taskId].status = 'completed';
-                if (useFirebase) {
-                    await updateDoc(doc(db, 'artifacts', appId, 'public', taskId), {
-                        resultImageA: resultA,
-                        resultImageB: resultB,
-                        status: 'completed'
-                    });
-                }
-                console.log(`🎉 號碼牌 #${taskId} 固定 IP 雙款合影完成！`);
-                break;
-            }
-        } catch (error) {
-            console.error(`⚠️ 輪詢或合成 #${taskId} 異常:`, error.message);
+            response = await fetch(`https://cloud.leonardo.ai/api/rest/v1/generations/${id}`, {
+                signal: AbortSignal.timeout(15000), headers: { authorization: `Bearer ${LEONARDO_API_KEY}` }
+            });
+        } catch { continue; }
+        if (response.status === 429 || response.status >= 500) continue;
+        if (!response.ok) throw new Error(`查詢任務 ${id} 失敗：${response.status}`);
+        const job = (await response.json()).generations_by_pk;
+        if (['FAILED','CANCELED','CANCELLED'].includes(job?.status)) throw new Error(`Leonardo 任務失敗：${id}`);
+        if (job?.status === 'COMPLETE') {
+            const url = job.generated_images?.[0]?.url;
+            if (!url) throw new Error(`任務 ${id} 未回傳圖片`);
+            task[`resultImage${suffix}`] = await finalizeFullScene(await downloadImageBuffer(url));
+            await saveGenerationState(task);
+            return;
         }
     }
-
-    if ((!resultA || !resultB) && resultA !== 'FAILED' && resultB !== 'FAILED') {
-        console.log(`⏳ 號碼牌 #${taskId} 已等待超過 360 秒，轉交後台手動處理。`);
+    throw new Error(`等待超時，請查 Leonardo 任務 ${id}；沒有自動重送付費生成`);
+}
+async function generateLeonardoDualStyles(taskId, guestBuffer) {
+    const task = localTasksCache[taskId];
+    try {
+        const guestId = await uploadBufferToLeonardoS3(guestBuffer);
+        const results = await Promise.allSettled([
+            runStyle(task, guestId, 'watercolor'), runStyle(task, guestId, 'chibi')
+        ]);
+        const errors = results.flatMap((r, i) => r.status === 'rejected'
+            ? [`${i === 0 ? '水彩版' : '超 Q 版'}：${r.reason.message}`] : []);
+        task.status = errors.length ? 'failed' : 'completed';
+        task.remark = errors.join('；');
+    } catch (error) {
+        task.status = 'failed';
+        task.remark = `失敗：${error.message}。請先查 Leonardo 紀錄再重送。`;
     }
+    await saveGenerationState(task);
 }
 
 app.post('/api/upload', async (req, res) => {
     try {
         const { image, sceneId = "digital-ark-green" } = req.body;
-        if (!image) return res.status(400).json({ error: '未提供圖片資料' });
+        if (!LEONARDO_API_KEY) return res.status(503).json({ error: 'B 機尚未設定 LEONARDO_API_KEY' });
+        let guestBuffer;
+        try { guestBuffer = await sharp(decodePhoto(image), { limitInputPixels: 40000000 }).rotate().resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true }).flatten({ background: '#ffffff' }).jpeg({ quality: 92 }).toBuffer(); }
+        catch { return res.status(400).json({ error: '照片格式無法讀取，請重新拍攝' }); }
         const scene = SCENES[sceneId];
         if (!scene) return res.status(400).json({ error: '不支援的互動情境' });
 
         const taskId = String(ticketCounter).padStart(3, '0');
         ticketCounter++;
 
-        const newTask = { id: taskId, sourceImage: image, sceneId, sceneName: scene.name, status: 'pending', resultImageA: null, resultImageB: null, chosenDesign: null, processStatus: '製作中', remark: '', createdAt: new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false }) };
+        const newTask = { id: taskId, sourceImage: image, sceneId, sceneName: scene.name, status: 'pending', resultImageA: null, resultImageB: null, chosenDesign: null, processStatus: '製作中', remark: '', styleAName: '水彩互動版', styleBName: '超 Q 互動版', createdAt: new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false }) };
         localTasksCache[taskId] = newTask;
         if (useFirebase) await setDoc(doc(db, 'artifacts', appId, 'public', taskId), newTask);
 
         console.log(`🎫 新任務建立：排隊號碼 #${taskId}`);
         res.json({ success: true, taskId: taskId });
 
-        if (LEONARDO_API_KEY) generateLeonardoDualStyles(taskId, image, sceneId);
+        generateLeonardoDualStyles(taskId, guestBuffer);
     } catch (error) { res.status(500).json({ error: '伺服器錯誤' }); }
 });
 
@@ -472,7 +286,13 @@ app.get('/health', (_req, res) => {
     res.json({
         success: true,
         booth: 'B',
-        layeredComposite: true,
+        pipelineVersion: 'leonardo-full-scene-v7',
+        imageProvider: 'leonardo-full-scene',
+        imageProviderConfigured: !!LEONARDO_API_KEY,
+        modelSideMask: false,
+        liveGenerationValidated: false,
+        styles: ['水彩互動版', '超 Q 互動版'],
+        layeredComposite: false,
         removeBgMode: REMOVE_BG_MODE,
         scenes: Object.keys(SCENES),
         firebase: useFirebase
@@ -483,7 +303,7 @@ app.get('/api/status/:taskId', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     const taskId = req.params.taskId; let task = localTasksCache[taskId];
     if (!task) return res.status(404).json({ error: '找不到該號碼任務' });
-    res.json({ success: true, status: task.status, resultImageA: task.resultImageA, resultImageB: task.resultImageB, chosenDesign: task.chosenDesign });
+    res.json({ success: true, status: task.status, resultImageA: task.resultImageA, resultImageB: task.resultImageB, chosenDesign: task.chosenDesign, error: task.status === 'failed' ? task.remark : null });
 });
 
 app.post('/api/choice/:taskId', async (req, res) => {
@@ -575,8 +395,8 @@ module.exports = {
     app,
     testHelpers: {
         SCENES,
-        removeMagentaBackgroundLocally,
-        normalizePersonToPoseCanvas,
-        compositeFixedScene
+        finalizeFullScene,
+        fullScenePrompt,
+        leonardoPayload
     }
 };
