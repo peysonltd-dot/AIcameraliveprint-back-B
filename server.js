@@ -25,19 +25,19 @@ let useFirebase = false;
 
 const appId = (process.env.APP_ID || "photo-booth-app").trim();
 const LEONARDO_API_KEY = (process.env.LEONARDO_API_KEY || "").trim();
-const REMOVE_BG_MODE = "none"; // v7: 整張合影生成，不去背、不做人物圖層合成。
+const REMOVE_BG_MODE = "local-chroma";
 const OUTPUT_WIDTH = 1024;
 const OUTPUT_HEIGHT = 768;
-const SCENES = {
-    "digital-ark-green": {
-        name: "與綠色 IP 共乘數位方舟",
-        referencePath: path.join(__dirname, "assets", "test-scene-reference.jpg"),
-        backgroundPath: path.join(__dirname, "assets", "layers", "digital-ark-green", "background.svg"),
-        ipPath: path.join(__dirname, "assets", "layers", "digital-ark-green", "ip.svg"),
-        boatPath: path.join(__dirname, "assets", "layers", "digital-ark-green", "boat.svg"),
-        composition: "One photographed guest on the left and exactly one official green mascot on the right sit TOGETHER INSIDE ONE digital ark boat. The guest faces the camera, leans toward the mascot and gently places an arm around its far shoulder. Integrate both bodies into the same cockpit, with the hull naturally occluding their lower bodies. Keep the full face and a meaningful part of the upper torso visible. Natural arm and hand anatomy; no limbs hanging outside, no second boat or pasted-on portrait."
-    }
-};
+const PRINT_MARGIN = 0.08;
+const CATALOG = require('./assets/ip-catalog.json');
+const SCENES = Object.fromEntries(CATALOG.map(ip => [ip.id, {
+    name: ip.name.zh,
+    description: ip.description,
+    referencePath: path.join(__dirname, 'assets', 'test-scene-reference.jpg'),
+    ipPath: path.join(__dirname, ip.preview),
+    boatPath: path.join(__dirname, 'assets', 'layers', 'digital-ark-green', 'boat.svg'),
+    composition: `One photographed guest on the left and exactly one selected mascot on the right sit TOGETHER INSIDE ONE digital ark boat. Selected character: ${ip.description}. The guest faces the camera, leans toward the mascot and gently places an arm around its shoulder, keeping the mascot's original accessories. Integrate both bodies into the same cockpit, with the hull naturally occluding their lower bodies. Show the entire head, complete mascot silhouette, complete boat and surrounding water splash cluster. Natural hands, no limbs hanging outside, no second boat.`
+}]));
 const Q_STYLE_REFERENCE_PATH = path.join(__dirname, "assets", "q-style-reference.jpg");
 const referenceCache = new Map();
 
@@ -139,18 +139,16 @@ async function artworkReference(file) {
     return sharp(file, { density: 144 }).resize(1024, 1024, { fit: 'contain', background: '#ffffff' })
         .flatten({ background: '#ffffff' }).jpeg({ quality: 95 }).toBuffer();
 }
+const { preparePrintPng } = require('./print-image');
 async function finalizeFullScene(buffer) {
-    // The provider returns the WHOLE finished scene. No chroma key, cutout, mask or overlay.
-    const result = await sharp(buffer).rotate().resize(OUTPUT_WIDTH, OUTPUT_HEIGHT, {
-        fit: 'contain', background: '#fffdf8'
-    }).flatten({ background: '#fffdf8' }).jpeg({ quality: 92, chromaSubsampling: '4:4:4' }).toBuffer();
-    return `data:image/jpeg;base64,${result.toString('base64')}`;
+    const result = await preparePrintPng(buffer, { width: OUTPUT_WIDTH, height: OUTPUT_HEIGHT, margin: PRINT_MARGIN });
+    return `data:image/png;base64,${result.toString('base64')}`;
 }
 function fullScenePrompt(scene, watercolor) {
     return [
         'Create ONE complete finished event illustration. Redraw the guest, the official mascot, the boat and the background together as a coherent scene, NOT as separate cutout stickers.',
         'REFERENCE PRIORITY: Reference 1 is the photographed guest and the ONLY human identity source. Preserve recognizable hairstyle, hair color, face shape, glasses, clothing colors and accessories. Never copy the person in any other reference.',
-        'Reference 2 is the AUTHORITATIVE OFFICIAL MASCOT DESIGN. Faithfully reproduce its silhouette, body proportions, ear shapes, face and mouth shapes, eye positions, exact green and cream color regions, cheek placement, tablet and other original accessories. Do not redesign, humanize, add costume, hat, extra ears, fingers or a new face. Keep its original visual identity even when adapting the guest drawing style.',
+        'Reference 2 is the AUTHORITATIVE OFFICIAL MASCOT DESIGN. Faithfully reproduce its silhouette, body proportions, ear shapes, face and mouth shapes, eye positions, exact original color regions, cheek placement and only the original accessories visible in reference 2. Do not redesign, humanize, add costume, hat, extra ears, fingers or a new face. Keep its original visual identity even when adapting the guest drawing style.',
         'Reference 3 is the AUTHORITATIVE BOAT DESIGN: retain the hull silhouette, teal/navy/cream/orange/yellow palette, circuit motifs, front emblem and rail arrangement. Exactly ONE boat in the entire image.',
         'Reference 4 is COMPOSITION and atmosphere ONLY: a close, friendly shared ride with a visible smiling guest. Ignore its sample human identity and any altered mascot, hat, logo or accessory. Where it conflicts with reference 2 or 3, the official reference 2 or 3 ALWAYS takes priority.',
         'Reference 5 is GUEST DRAWING STYLE ONLY: never copy its identity, clothing, props, mascot or text.',
@@ -158,8 +156,9 @@ function fullScenePrompt(scene, watercolor) {
         watercolor
             ? 'GUEST STYLE: customer watercolor illustration, approximately four-head-tall proportions, natural smiling eyes, recognizable face, fine ink outlines, soft watercolor shading and light paper grain. Avoid photographic skin and oversized black chibi eyes.'
             : 'GUEST STYLE: super cute minimalist hand-drawn chibi, approximately 2.5-head-tall proportions, a large round head, simple oval black eyes, tiny nose and mouth, rosy cheeks, textured crayon outlines, compact limbs and flat colors. Not realistic adult proportions.',
-        'Use a harmonious light cream and pale aqua illustrated background, subtle water splashes around the single boat, consistent perspective and lighting. Adapt the composition to the guest proportions so they sit naturally inside the cockpit. Never cover the guest face with the hull.',
-        'Exactly one human, one official green mascot and one boat. No extra mascot, boat, chair, duplicate limb, floating cutout, magenta background, collage border, caption, invented lettering or event logo. Keep important characters and the hull within the 4:3 landscape frame.',
+        'PRINT CUTOUT COMPOSITION: the artwork is one complete island of guest, selected mascot, boat, blue/aqua water and water splashes. Retain blue water and solid white foam as part of the drawing. Outside that cluster use ONLY uniform pure magenta #FF00FF with no paper, rectangular color wash, gradient, scenery or shadow. The magenta will be removed by software. Never use that exact key color inside the artwork.',
+        'ZOOM OUT. Leave at least 12 percent clear magenta margin on ALL FOUR SIDES, including around stray droplets, ears, hats, staff, telescope, hair and the bottommost wave. Fit the ENTIRE artwork within the central 76 percent of the canvas. Nothing may touch the image boundary. Never crop the boat, head, mascot accessories or splashes. Keep the camera perspective harmonious and both figures seated inside the hull.',
+        'Exactly one human, one selected mascot from reference 2 and one boat. Do not include the green example mascot unless the selected reference 2 is green. No extra mascot, boat, chair, duplicate limb, pasted-on portrait, collage border, caption, invented lettering or event logo. Keep important characters and the hull within the 4:3 landscape frame.',
         'Final visual priority: recognizable guest; faithful official mascot and boat designs; natural shared seating and shoulder interaction; consistent overall illustration.'
     ].join(' ');
 }
@@ -196,6 +195,7 @@ async function saveGenerationState(task) {
     if (useFirebase) await updateDoc(doc(db, 'artifacts', appId, 'public', task.id), {
         status: task.status, remark: task.remark,
         generationIdA: task.generationIdA || null, generationIdB: task.generationIdB || null,
+        originalGenerationUrlA: task.originalGenerationUrlA || null, originalGenerationUrlB: task.originalGenerationUrlB || null,
         resultImageA: task.resultImageA, resultImageB: task.resultImageB
     }).catch(error => console.error('生成資料雲端同步失敗:', error.message));
 }
@@ -204,10 +204,10 @@ async function runStyle(task, guestId, styleKey) {
     const watercolor = styleKey === 'watercolor';
     const suffix = watercolor ? 'A' : 'B';
     const [ipId, boatId, compositionId, styleId] = await Promise.all([
-        getReference(`${task.sceneId}-official-ip-v7`, () => artworkReference(scene.ipPath)),
-        getReference(`${task.sceneId}-official-boat-v7`, () => artworkReference(scene.boatPath)),
-        getReference(`${task.sceneId}-composition-v7`, () => fs.promises.readFile(scene.referencePath)),
-        getReference(`guest-style-${styleKey}-v7`, async () => watercolor
+        getReference(`${task.sceneId}-official-ip-v8`, () => artworkReference(scene.ipPath)),
+        getReference(`${task.sceneId}-official-boat-v8`, () => artworkReference(scene.boatPath)),
+        getReference(`${task.sceneId}-composition-v8`, () => fs.promises.readFile(scene.referencePath)),
+        getReference(`guest-style-${styleKey}-v8`, async () => watercolor
             ? sharp(scene.referencePath).extract({ left: 105, top: 0, width: 430, height: 455 })
                 .resize(768, 768, { fit: 'contain', background: '#fffdf8' }).jpeg({ quality: 92 }).toBuffer()
             : fs.promises.readFile(Q_STYLE_REFERENCE_PATH))
@@ -233,6 +233,7 @@ async function runStyle(task, guestId, styleKey) {
         if (job?.status === 'COMPLETE') {
             const url = job.generated_images?.[0]?.url;
             if (!url) throw new Error(`任務 ${id} 未回傳圖片`);
+            task[`originalGenerationUrl${suffix}`] = url;
             task[`resultImage${suffix}`] = await finalizeFullScene(await downloadImageBuffer(url));
             await saveGenerationState(task);
             return;
@@ -282,15 +283,19 @@ app.post('/api/upload', async (req, res) => {
     } catch (error) { res.status(500).json({ error: '伺服器錯誤' }); }
 });
 
+app.get('/api/scenes', (_req, res) => res.json({ success: true, scenes: CATALOG.map(({id,name,preview}) => ({id,name,preview})) }));
+
 app.get('/health', (_req, res) => {
     res.json({
         success: true,
         booth: 'B',
-        pipelineVersion: 'leonardo-full-scene-v7',
+        pipelineVersion: 'leonardo-multi-ip-print-v8',
         imageProvider: 'leonardo-full-scene',
         imageProviderConfigured: !!LEONARDO_API_KEY,
         modelSideMask: false,
         liveGenerationValidated: false,
+        printFormat: "image/png",
+        printMargin: PRINT_MARGIN,
         styles: ['水彩互動版', '超 Q 互動版'],
         layeredComposite: false,
         removeBgMode: REMOVE_BG_MODE,

@@ -1,50 +1,60 @@
-# B 機 Leonardo 整張重繪版 v7
+# B 機 v8：六個 IP、完整構圖、透明 PNG
 
-本次依需求改為人物、IP、船身、背景一起生成。兩款保留水彩與超 Q。已停止人物去背、固定座標、遮罩裁切與原稿回蓋；舊分層檔案即使留在儲存庫也不會被用來合成成品。
+## 部署
 
-## 覆蓋與部署
+解壓縮後把全部內容覆蓋到 peysonltd-dot/AIcameraliveprint-back-B 根目錄，包括新增的 print-image.js、assets/ip-catalog.json、assets/ips/。不要只上傳 ZIP。其他同名檔案也需一起覆蓋。
+Render 保留 LEONARDO_API_KEY、FIREBASE_CONFIG、APP_ID、飛鵝等環境設定；Node 22 以上，Build Command: npm ci，Start Command: npm start。
+不需要 OpenAI 金鑰。舊 IMAGE_PROVIDER、OPENAI_*、REMOVE_BG_MODE 不影響本版流程。
 
-解壓縮後把內容覆蓋到 peysonltd-dot/AIcameraliveprint-back-B 根目錄，包含 server.js、package.json、package-lock.json、assets/、tests/。不要只上傳 ZIP，也不要再多包一層資料夾。
-不要覆蓋 A 機 peysonltd-dot/-AIcameraliveprint-back。
-
-Render 保留既有 LEONARDO_API_KEY、FIREBASE_CONFIG、APP_ID、飛鵝等設定。使用 Node 22 以上（NODE_VERSION=22），Build Command 為 npm ci，Start Command 為 npm start。
-不需要 OpenAI 金鑰。IMAGE_PROVIDER、OPENAI_*、REMOVE_BG_MODE 舊變數不影響本版流程；可以移除。
-
-部署後開 https://aicamera-backend-b.onrender.com/health ，確認：
-- pipelineVersion: leonardo-full-scene-v7
-- imageProvider: leonardo-full-scene
-- imageProviderConfigured: true
+https://aicamera-backend-b.onrender.com/health 應顯示：
+- pipelineVersion: leonardo-multi-ip-print-v8
+- printFormat: image/png
+- printMargin: 0.08
+- removeBgMode: local-chroma
 - layeredComposite: false
-- removeBgMode: none
+- scenes: 六個角色 ID
 
-再上傳 B 前台 v7，更新後應看到水彩互動版與超 Q 互動版。請只用新任務測試，舊任務圖片不會自動重畫。
+接著部署 B 前台 v8，開始一筆新任務測試。A 機前後台都不需要更改。
 
-## 參考圖與生成方式
+## IP 選擇
 
-每款按以下順序送出五張參考：
-1. 賓客照片：唯一的人物身分參考。
-2. 官方 ip.svg：IP 造型、輪廓、配色、臉部、配件的優先依據。
-3. 官方 boat.svg：方舟造型、配色、電路圖案的優先依據。
-4. test-scene-reference.jpg：只參考雙方同坐船內、搭肩與整體構圖。
-5. 畫風參考：水彩使用構圖範例的人物局部；超 Q 使用 q-style-reference.jpg。
+素材來自您提供的 Google Drive / SVG 資料夾，資產 3–8，未改動畫稿。
+名稱為方便選擇的外觀名稱，不當作官方角色命名：
+- 綠色平板夥伴：資產 8.svg
+- 黃色耳機夥伴：資產 4.svg
+- 橘色探索夥伴：資產 5.svg
+- 紫色魔法夥伴：資產 7.svg
+- 白色雲朵夥伴：資產 6.svg
+- 藍色望遠鏡夥伴：資產 3.svg
 
-提示詞明確規定官方 IP 與船身原稿優先，禁止從構圖範例抄帽子、改造型或多生成一艘船。賓客與一隻指定 IP 同坐一艘方舟，人物下半身由船身自然遮擋。全部由模型整體生成，伺服器只統一尺寸與 JPEG 格式，不局部合成。
+前台先選其中一個 IP，再拍照並產生水彩／超 Q 兩款。每次只生成賓客＋所選的一個 IP＋一艘船，不會一次放六隻。後台任務保存選擇的角色名稱。
+後端 /api/scenes 提供角色清單；前台 assets/ip-catalog.js 和兩端 ip-catalog.json 需保持一致。
 
-水彩版用 Leonardo gemini-2.5-flash-image；超 Q 版用 Leonardo gpt-image-2 / LOW。每款 quantity 1、1024×768。gpt-image-2 在此仍由 Leonardo 計費，沒有呼叫 OpenAI API。
-Nano Banana 參考權重：人物、IP、船身 HIGH，構圖 LOW、畫風 MID。GPT Image 2 不支援參考 strength，透過提示詞區分用途。這些指示並非鎖定機制，IP 細節仍可能改變。
+## 圖片處理
+
+維持整張合影一起重繪。官方 IP 和船是獨立參考，模型盡量遵循；沒有固定 IP 疊回去。原稿相似度仍須人工驗收。
+
+生成指令要求全圖縮小、含配件與水滴在內四周至少留 12% 底色。人物、IP、整艘船、藍色水花與白色泡沫一起畫出；外圍使用單一純洋紅底色以便伺服器去除，不生成奶油色方形紙張背景。
+
+print-image.js 對整張圖去除外圍底色，保留白色角色、白色衣物、白泡沫與藍色水花，再按整組圖案的透明邊界等比例置中。最終 1024×768 RGBA PNG，左右至少 82px、上下至少 62px 透明空隙（約 8%）。不水平反轉；若印製工法需要反轉，仍由工作人員在印製軟體中設定。
+
+此去背在 Render 執行，不需要現場帶著開發用電腦，也沒有另外呼叫付費去背 API。圖案仍為整張生成，與先前的固定人物位置、原稿 IP 分層合成不同。
+
+若 AI 把主體畫到來源圖邊界，程式會拒絕該款並回報可能裁切；增加透明空隙不能補回原本遺失的內容。若背景不符合透明處理要求，也回報失敗，不會把白底 JPG 改副檔名當成透明 PNG。自動檢查不能辨識所有缺手、少配件等語意問題，仍需看成品。
+
+色鍵去背有實際限制：極接近純洋紅的衣服／小配件可能被誤去除，半透明水花邊緣可能有色邊。請測試粉紫色衣物、長髮、白衣及各隻 IP。若上述情形常見，需改用分割去背方案另測品質與成本。
+
+## 後台下載與失敗處理
+
+新任務成品是真正含 alpha 的 PNG；後台下載和手機下載均保留 PNG。人工補傳結果也改存 PNG，避免透明背景被轉成 JPG。舊任務 JPG 維持 JPG，不會自動重新產圖或去背。
+所有結果預覽用 object-contain，前台用棋盤格顯示透明範圍。下載圖不含棋盤格。
+單款失敗會保留已完成的另一款；originalGenerationUrlA/B 及 generationIdA/B 可供查原始生成記錄。付費生成不自動重送，人工重試另產生用量。
 
 ## 費用與驗收
 
-正常每客兩張、兩次生成，無去背 API 費用。五張參考圖相較前版增加了輸入內容，不保證價格完全相同；請以 Leonardo API 用量紀錄確認實際扣款。失敗或超時不會自動重送付費生成，人工再次送出會產生新用量。
+仍使用 Leonardo 的 gemini-2.5-flash-image（水彩）及 gpt-image-2 / LOW（超 Q），各一張，五張參考。每位正常兩次生成，金額以 Leonardo 實際 API 扣款紀錄為準。
+已做離線模擬測試，沒有執行真實付費生成：
+- node tests/print-image.cjs：透明 alpha、8% 留白、白／紫／藍保留、來源裁切或不符底色時拒絕。
+- node tests/pipeline.cjs：六隻各自參考圖、兩款請求、PNG 輸出、失敗保留另一款、不自動付費重試。
 
-已做離線模擬測試：node tests/pipeline.cjs。包含五張參考順序、兩種模型、整圖不去背不覆蓋、尺寸、照片驗證及單款失敗保留另一款。
-尚未執行真實付費產圖，無法宣稱已驗證 IP 相似度、人物相似度、搭肩或生成成功率。
-正式印製前請檢查 IP 輪廓、臉部、配色、配件，以及是否只有一個人物、一個 IP、一艘船。整張重繪無法保證 IP 與原檔完全一致；若客戶要求完全相同，須另用固定素材方案。
-
-前台預覽是構圖示意，不是本版實際生成案例；預覽出現的帽子等造型不代表指定 IP 原稿。
-
-原有 Firebase base64 圖片保存方式未更換，大圖可能碰到文件大小上限。記憶體暫存不等於永久保存，請留意 Render log 的雲端同步錯誤。重啟後不會自動恢復未完成任務輪詢，請先依 generationIdA/B 查 Leonardo 紀錄再重送。
-
-參數參考：
-https://docs.leonardo.ai/docs/nano-banana
-https://docs.leonardo.ai/v1.0/docs/gpt-image-2
+原有 Firebase base64 保存架構未更換，PNG 容量比 JPEG 大，更可能碰到 Firestore 文件大小限制；請注意 Render 雲端同步錯誤，活動前完成儲存測試。記憶體暫存不等於永久保存，重啟後未完成任務不自動恢復。正式大量活動應另接圖片物件儲存，不能只依賴記憶體。

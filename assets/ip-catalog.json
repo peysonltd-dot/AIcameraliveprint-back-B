@@ -1,0 +1,68 @@
+[
+  {
+    "id": "digital-ark-green",
+    "name": {
+      "zh": "綠色平板夥伴",
+      "jp": "緑のタブレット仲間",
+      "en": "Green Tablet Buddy"
+    },
+    "preview": "assets/ips/green.svg",
+    "description": "green and cream rounded mascot with a tablet and a lightbulb motif; preserve the original ears and mouth",
+    "sourceFile": "資產 8.svg"
+  },
+  {
+    "id": "digital-ark-yellow",
+    "name": {
+      "zh": "黃色耳機夥伴",
+      "jp": "黄色のヘッドホン仲間",
+      "en": "Yellow Headset Buddy"
+    },
+    "preview": "assets/ips/yellow.svg",
+    "description": "yellow rounded mascot with dark headphones and an orange bow tie; preserve headset and face",
+    "sourceFile": "資產 4.svg"
+  },
+  {
+    "id": "digital-ark-orange",
+    "name": {
+      "zh": "橘色探索夥伴",
+      "jp": "オレンジの探検仲間",
+      "en": "Orange Explorer"
+    },
+    "preview": "assets/ips/orange.svg",
+    "description": "orange pointed-head mascot holding a magnifying glass, with lightning motif; preserve the lens and original features",
+    "sourceFile": "資產 5.svg"
+  },
+  {
+    "id": "digital-ark-purple",
+    "name": {
+      "zh": "紫色魔法夥伴",
+      "jp": "紫の魔法仲間",
+      "en": "Purple Magic Buddy"
+    },
+    "preview": "assets/ips/purple.svg",
+    "description": "pale purple fluffy mascot with a purple wizard hat and wooden staff; preserve hat emblem and staff",
+    "sourceFile": "資產 7.svg"
+  },
+  {
+    "id": "digital-ark-white",
+    "name": {
+      "zh": "白色雲朵夥伴",
+      "jp": "白い雲の仲間",
+      "en": "White Cloud Buddy"
+    },
+    "preview": "assets/ips/white.svg",
+    "description": "white fluffy cloud-like rounded mascot with scalloped outline and pink cheeks; preserve its white body and face",
+    "sourceFile": "資產 6.svg"
+  },
+  {
+    "id": "digital-ark-blue",
+    "name": {
+      "zh": "藍色望遠鏡夥伴",
+      "jp": "青い望遠鏡仲間",
+      "en": "Blue Telescope Buddy"
+    },
+    "preview": "assets/ips/blue.svg",
+    "description": "blue tall rectangular folded-top mascot looking through a dark telescope; preserve its unusual rectangular silhouette and telescope",
+    "sourceFile": "資產 3.svg"
+  }
+]
