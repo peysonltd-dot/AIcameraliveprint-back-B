@@ -8,7 +8,7 @@ process.env.IMAGE_PROVIDER = 'openai-protected';
 process.env.REMOVE_BG_MODE = 'leonardo';
 delete process.env.FIREBASE_CONFIG;
 const realFetch = global.fetch;
-let count = 0, generationRequests = [], rejectChibi = false;
+let count = 0, generationRequests = [], rejectChibi = false, plainBackground = false;
 (async () => {
  const dir = path.join(__dirname, '../assets/layers/digital-ark-green');
  // A full scene on a uniform key backdrop; output must preserve its colored artwork and remove only the backdrop.
@@ -25,7 +25,7 @@ let count = 0, generationRequests = [], rejectChibi = false;
    return Response.json({generate:{generationId:payload.model}});
   }
   if(url.includes('/v1/generations/')) return Response.json({generations_by_pk:{status:'COMPLETE',generated_images:[{url:'https://mock/image'}]}});
-  if(url==='https://mock/image') return new Response(fixture);
+  if(url==='https://mock/image') return new Response(plainBackground ? await sharp({create:{width:1024,height:768,channels:3,background:'#777777'}}).png().toBuffer() : fixture);
   throw Error('Unexpected external request '+url);
  };
  const {app,testHelpers:h}=require('../server');
@@ -68,7 +68,7 @@ let count = 0, generationRequests = [], rejectChibi = false;
   assert.equal(gemini.parameters.guidances.image_reference[1].strength,'HIGH');
   assert.equal(gemini.parameters.guidances.image_reference[3].strength,'LOW');
   assert.equal(gpt.parameters.quantity,1); assert.equal(gemini.parameters.quantity,1);
-  rejectChibi=true; const failed=await run(); assert.equal(failed.status,'failed'); assert(failed.resultImageA); assert(!failed.resultImageB); assert(failed.error.includes('test rejection'));
+  rejectChibi=true; const failed=await run(); assert.equal(failed.status,'partial'); assert(failed.resultImageA); assert(!failed.resultImageB); assert(failed.error.includes('test rejection'));
   assert.equal(generationRequests.length,4,'no billable retries');
   rejectChibi=false;
   const catalog=await realFetch(base+'/api/scenes').then(r=>r.json());
@@ -81,6 +81,13 @@ let count = 0, generationRequests = [], rejectChibi = false;
    const conf=require('../assets/ip-catalog.json').find(x=>x.id===scene.id);assert(payload.parameters.prompt.includes(conf.description));
   }
   assert.equal(ids.size,6,'each IP gets a distinct official reference');
+  plainBackground=true; const review=await run();assert.equal(review.status,'completed');assert.equal(review.printStatusA,'review');assert(review.resultImageA.startsWith('data:image/jpeg'));
+  const before=generationRequests.length;
+  plainBackground=false;
+  const repaired=await realFetch(base+'/api/admin/reprocess/009',{method:'POST'}).then(r=>r.json());assert.equal(repaired.success,true);
+  assert.equal(generationRequests.length,before,'local reprocessing must not start a paid generation');
+  const fixed=await realFetch(base+'/api/status/009').then(r=>r.json());assert.equal(fixed.printStatusA,'ready');assert(fixed.resultImageA.startsWith('data:image/png'));
+  const invalidChoice=await realFetch(base+'/api/choice/002',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({choice:'B'})});assert.equal(invalidChoice.status,400);
   console.log('PASS: Leonardo-only routing, two styles, five ordered references, six IPs, transparent PNG with guaranteed margins, invalid photo rejection, partial failure retained, no paid retries. MOCKED results only.');
  } finally { server.close(); global.fetch=realFetch; }
 })().catch(e=>{console.error(e);process.exitCode=1});

@@ -139,10 +139,21 @@ async function artworkReference(file) {
     return sharp(file, { density: 144 }).resize(1024, 1024, { fit: 'contain', background: '#ffffff' })
         .flatten({ background: '#ffffff' }).jpeg({ quality: 95 }).toBuffer();
 }
-const { preparePrintPng } = require('./print-image');
+const { preparePrintResult } = require('./print-image');
 async function finalizeFullScene(buffer) {
-    const result = await preparePrintPng(buffer, { width: OUTPUT_WIDTH, height: OUTPUT_HEIGHT, margin: PRINT_MARGIN });
-    return `data:image/png;base64,${result.toString('base64')}`;
+    const result = await preparePrintResult(buffer, { width: OUTPUT_WIDTH, height: OUTPUT_HEIGHT, margin: PRINT_MARGIN });
+    return { image: `data:${result.mime};base64,${result.buffer.toString('base64')}`, printStatus: result.printStatus, warning: result.warning };
+}
+function updateTaskOutcome(task, errors=[]) {
+    const available = Number(!!task.resultImageA)+Number(!!task.resultImageB);
+    task.status = available === 2 ? 'completed' : available === 1 ? 'partial' : 'failed';
+    const warnings=['A','B'].flatMap(s => task[`printWarning${s}`] ? [`${s}款：${task[`printWarning${s}`]}`] : []);
+    task.remark=[...errors,...warnings].join('；');
+}
+function assignPrintResult(task,suffix,result) {
+    task[`resultImage${suffix}`]=result.image;
+    task[`printStatus${suffix}`]=result.printStatus;
+    task[`printWarning${suffix}`]=result.warning;
 }
 function fullScenePrompt(scene, watercolor) {
     return [
@@ -196,7 +207,9 @@ async function saveGenerationState(task) {
         status: task.status, remark: task.remark,
         generationIdA: task.generationIdA || null, generationIdB: task.generationIdB || null,
         originalGenerationUrlA: task.originalGenerationUrlA || null, originalGenerationUrlB: task.originalGenerationUrlB || null,
-        resultImageA: task.resultImageA, resultImageB: task.resultImageB
+        resultImageA: task.resultImageA, resultImageB: task.resultImageB,
+        printStatusA: task.printStatusA || null, printStatusB: task.printStatusB || null,
+        printWarningA: task.printWarningA || '', printWarningB: task.printWarningB || ''
     }).catch(error => console.error('生成資料雲端同步失敗:', error.message));
 }
 async function runStyle(task, guestId, styleKey) {
@@ -234,7 +247,7 @@ async function runStyle(task, guestId, styleKey) {
             const url = job.generated_images?.[0]?.url;
             if (!url) throw new Error(`任務 ${id} 未回傳圖片`);
             task[`originalGenerationUrl${suffix}`] = url;
-            task[`resultImage${suffix}`] = await finalizeFullScene(await downloadImageBuffer(url));
+            assignPrintResult(task, suffix, await finalizeFullScene(await downloadImageBuffer(url)));
             await saveGenerationState(task);
             return;
         }
@@ -250,14 +263,29 @@ async function generateLeonardoDualStyles(taskId, guestBuffer) {
         ]);
         const errors = results.flatMap((r, i) => r.status === 'rejected'
             ? [`${i === 0 ? '水彩版' : '超 Q 版'}：${r.reason.message}`] : []);
-        task.status = errors.length ? 'failed' : 'completed';
-        task.remark = errors.join('；');
+        updateTaskOutcome(task,errors);
     } catch (error) {
         task.status = 'failed';
         task.remark = `失敗：${error.message}。請先查 Leonardo 紀錄再重送。`;
     }
     await saveGenerationState(task);
 }
+
+// Reprocess a known task's existing originals only. Never starts billable image generation.
+app.post('/api/admin/reprocess/:taskId', async (req,res) => {
+    const task=localTasksCache[req.params.taskId];
+    if(!task)return res.status(404).json({error:'找不到任務'});
+    if(task.reprocessing || task.status==='pending')return res.status(409).json({error:'任務仍在處理中'});
+    const sides=['A','B'].filter(s=>task[`originalGenerationUrl${s}`]);
+    if(!sides.length)return res.status(400).json({error:'沒有保留的生成原圖，請從 Leonardo 下載後補傳'});
+    task.reprocessing=true;
+    try {
+        const results=await Promise.allSettled(sides.map(async s=>assignPrintResult(task,s,await finalizeFullScene(await downloadImageBuffer(task[`originalGenerationUrl${s}`])))));
+        const errors=results.flatMap((r,i)=>r.status==='rejected'?[`${sides[i]}款原圖處理失敗：${r.reason.message}`]:[]);
+        updateTaskOutcome(task,errors); await saveGenerationState(task);
+        res.json({success:true,status:task.status,warning:task.remark});
+    } finally { task.reprocessing=false; }
+});
 
 app.post('/api/upload', async (req, res) => {
     try {
@@ -289,7 +317,7 @@ app.get('/health', (_req, res) => {
     res.json({
         success: true,
         booth: 'B',
-        pipelineVersion: 'leonardo-multi-ip-print-v8',
+        pipelineVersion: 'leonardo-multi-ip-print-v9',
         imageProvider: 'leonardo-full-scene',
         imageProviderConfigured: !!LEONARDO_API_KEY,
         modelSideMask: false,
@@ -308,12 +336,13 @@ app.get('/api/status/:taskId', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     const taskId = req.params.taskId; let task = localTasksCache[taskId];
     if (!task) return res.status(404).json({ error: '找不到該號碼任務' });
-    res.json({ success: true, status: task.status, resultImageA: task.resultImageA, resultImageB: task.resultImageB, chosenDesign: task.chosenDesign, error: task.status === 'failed' ? task.remark : null });
+    res.json({ success: true, status: task.status, resultImageA: task.resultImageA, resultImageB: task.resultImageB, chosenDesign: task.chosenDesign, error: ['failed','partial'].includes(task.status) ? task.remark : null, printStatusA: task.printStatusA, printStatusB: task.printStatusB });
 });
 
 app.post('/api/choice/:taskId', async (req, res) => {
     const taskId = req.params.taskId; const { choice } = req.body; const task = localTasksCache[taskId];
     if (!task) return res.status(404).json({ error: '找不到該任務' });
+    if (!['A','B'].includes(choice) || !task[`resultImage${choice}`]) return res.status(400).json({ error: '這款圖片尚未完成，請選擇已完成的款式' });
     task.chosenDesign = choice;
     triggerFeiePrint(task);
     if (useFirebase) await updateDoc(doc(db, 'artifacts', appId, 'public', taskId), { chosenDesign: choice });
