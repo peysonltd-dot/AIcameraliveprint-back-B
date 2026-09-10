@@ -146,7 +146,7 @@ async function finalizeFullScene(buffer) {
 }
 function updateTaskOutcome(task, errors=[]) {
     const available = Number(!!task.resultImageA)+Number(!!task.resultImageB);
-    task.status = available === 2 ? 'completed' : available === 1 ? 'partial' : 'failed';
+    task.status = task.styleMode === 'chibi-only' ? (task.resultImageB ? 'completed' : 'failed') : (available === 2 ? 'completed' : available === 1 ? 'partial' : 'failed');
     const warnings=['A','B'].flatMap(s => task[`printWarning${s}`] ? [`${s}款：${task[`printWarning${s}`]}`] : []);
     task.remark=[...errors,...warnings].join('；');
 }
@@ -254,16 +254,12 @@ async function runStyle(task, guestId, styleKey) {
     }
     throw new Error(`等待超時，請查 Leonardo 任務 ${id}；沒有自動重送付費生成`);
 }
-async function generateLeonardoDualStyles(taskId, guestBuffer) {
+async function generateLeonardoChibi(taskId, guestBuffer) {
     const task = localTasksCache[taskId];
     try {
         const guestId = await uploadBufferToLeonardoS3(guestBuffer);
-        const results = await Promise.allSettled([
-            runStyle(task, guestId, 'watercolor'), runStyle(task, guestId, 'chibi')
-        ]);
-        const errors = results.flatMap((r, i) => r.status === 'rejected'
-            ? [`${i === 0 ? '水彩版' : '超 Q 版'}：${r.reason.message}`] : []);
-        updateTaskOutcome(task,errors);
+        await runStyle(task, guestId, 'chibi');
+        updateTaskOutcome(task);
     } catch (error) {
         task.status = 'failed';
         task.remark = `失敗：${error.message}。請先查 Leonardo 紀錄再重送。`;
@@ -276,7 +272,7 @@ app.post('/api/admin/reprocess/:taskId', async (req,res) => {
     const task=localTasksCache[req.params.taskId];
     if(!task)return res.status(404).json({error:'找不到任務'});
     if(task.reprocessing || task.status==='pending')return res.status(409).json({error:'任務仍在處理中'});
-    const sides=['A','B'].filter(s=>task[`originalGenerationUrl${s}`]);
+    const sides=(task.styleMode === 'chibi-only' ? ['B'] : ['A','B']).filter(s=>task[`originalGenerationUrl${s}`]);
     if(!sides.length)return res.status(400).json({error:'沒有保留的生成原圖，請從 Leonardo 下載後補傳'});
     task.reprocessing=true;
     try {
@@ -300,14 +296,14 @@ app.post('/api/upload', async (req, res) => {
         const taskId = String(ticketCounter).padStart(3, '0');
         ticketCounter++;
 
-        const newTask = { id: taskId, sourceImage: image, sceneId, sceneName: scene.name, status: 'pending', resultImageA: null, resultImageB: null, chosenDesign: null, processStatus: '製作中', remark: '', styleAName: '水彩互動版', styleBName: '超 Q 互動版', createdAt: new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false }) };
+        const newTask = { id: taskId, sourceImage: image, sceneId, sceneName: scene.name, styleMode: 'chibi-only', status: 'pending', resultImageA: null, resultImageB: null, chosenDesign: null, processStatus: '製作中', remark: '', styleBName: '合影', createdAt: new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false }) };
         localTasksCache[taskId] = newTask;
         if (useFirebase) await setDoc(doc(db, 'artifacts', appId, 'public', taskId), newTask);
 
         console.log(`🎫 新任務建立：排隊號碼 #${taskId}`);
         res.json({ success: true, taskId: taskId });
 
-        generateLeonardoDualStyles(taskId, guestBuffer);
+        generateLeonardoChibi(taskId, guestBuffer);
     } catch (error) { res.status(500).json({ error: '伺服器錯誤' }); }
 });
 
@@ -317,14 +313,15 @@ app.get('/health', (_req, res) => {
     res.json({
         success: true,
         booth: 'B',
-        pipelineVersion: 'leonardo-multi-ip-print-v9',
+        pipelineVersion: 'leonardo-chibi-print-v10',
         imageProvider: 'leonardo-full-scene',
         imageProviderConfigured: !!LEONARDO_API_KEY,
         modelSideMask: false,
         liveGenerationValidated: false,
         printFormat: "image/png",
         printMargin: PRINT_MARGIN,
-        styles: ['水彩互動版', '超 Q 互動版'],
+        styles: ['chibi'],
+        generationsPerGuest: 1,
         layeredComposite: false,
         removeBgMode: REMOVE_BG_MODE,
         scenes: Object.keys(SCENES),
@@ -343,6 +340,8 @@ app.post('/api/choice/:taskId', async (req, res) => {
     const taskId = req.params.taskId; const { choice } = req.body; const task = localTasksCache[taskId];
     if (!task) return res.status(404).json({ error: '找不到該任務' });
     if (!['A','B'].includes(choice) || !task[`resultImage${choice}`]) return res.status(400).json({ error: '這款圖片尚未完成，請選擇已完成的款式' });
+    if (task.styleMode === 'chibi-only' && choice !== 'B') return res.status(400).json({ error: '請確認本次合影' });
+    if (task[`printStatus${choice}`] !== 'ready' || task.reprocessing) return res.status(409).json({ error: '合影需由工作人員確認後才能送出' });
     task.chosenDesign = choice;
     triggerFeiePrint(task);
     if (useFirebase) await updateDoc(doc(db, 'artifacts', appId, 'public', taskId), { chosenDesign: choice });
@@ -379,12 +378,40 @@ app.get('/api/admin/task-result-images/:taskId', async (req, res) => {
 });
 
 app.post('/api/admin/upload-result-dual/:taskId', async (req, res) => {
-    const taskId = req.params.taskId; const { resultImageA, resultImageB } = req.body; const task = localTasksCache[taskId];
-    if (!task) return res.status(404).json({ error: '找不到該任務' });
-    if (resultImageA) task.resultImageA = resultImageA; if (resultImageB) task.resultImageB = resultImageB;
-    if (task.resultImageA && task.resultImageB) task.status = 'completed';
-    if (useFirebase) await updateDoc(doc(db, 'artifacts', appId, 'public', taskId), { resultImageA: task.resultImageA, resultImageB: task.resultImageB, status: task.status });
-    res.json({ success: true });
+    const task=localTasksCache[req.params.taskId];
+    if(!task)return res.status(404).json({error:'找不到該任務'});
+    if(task.reprocessing || task.status==='pending')return res.status(409).json({error:'任務仍在處理中'});
+    const sides=(task.styleMode==='chibi-only'?['B']:['A','B']).filter(s=>req.body[`resultImage${s}`]);
+    if(!sides.length)return res.status(400).json({error:'請上傳合影圖片'});
+    task.reprocessing=true;
+    try {
+        const prepared=await Promise.all(sides.map(async s=>[s,await finalizeFullScene(decodePhoto(req.body[`resultImage${s}`]))]));
+        for(const [s,result] of prepared)assignPrintResult(task,s,result);
+        updateTaskOutcome(task);await saveGenerationState(task);
+        res.json({success:true});
+    } catch(error){res.status(400).json({error:'無法處理上傳圖片：'+error.message});}
+    finally{task.reprocessing=false;}
+});
+
+// An explicit staff visual review can release a PNG; JPEG previews cannot be approved for transparent printing.
+app.post('/api/admin/approve-result/:taskId', async (req,res) => {
+    const task=localTasksCache[req.params.taskId],side=req.body.choice;
+    if(!task)return res.status(404).json({error:'找不到該任務'});
+    if(task.reprocessing || task.status==='pending')return res.status(409).json({error:'任務仍在處理中'});
+    if(!['A','B'].includes(side) || req.body.confirmed!==true)return res.status(400).json({error:'請先檢查合影'});
+    const image=task[`resultImage${side}`];
+    if(!image?.startsWith('data:image/png;base64,'))return res.status(400).json({error:'這是未去背預覽，請先補傳處理完成的透明 PNG'});
+    try {
+        const {data,info}=await sharp(decodePhoto(image)).ensureAlpha().raw().toBuffer({resolveWithObject:true});
+        let visible=0;
+        for(let y=0;y<info.height;y++)for(let x=0;x<info.width;x++) {
+            const a=data[(y*info.width+x)*4+3];if(a>0)visible++;
+            if((x===0||y===0||x===info.width-1||y===info.height-1)&&a>0)throw Error('圖片外圍須透明');
+        }
+        if(visible<100)throw Error('圖片沒有可見圖案');
+        task[`printStatus${side}`]='ready';task[`printWarning${side}`]='工作人員已確認透明背景、完整構圖及邊緣';
+        updateTaskOutcome(task);await saveGenerationState(task);res.json({success:true});
+    } catch(error){res.status(400).json({error:error.message});}
 });
 
 app.post('/api/admin/reset-all', async (req, res) => {
