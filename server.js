@@ -7,23 +7,28 @@ const cors = require('cors');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { createAdminAuth } = require('./admin-auth');
 const sharp = require('sharp');
-const { initializeApp } = require('firebase/app');
-const { getFirestore, doc, setDoc, getDoc, collection, getDocs, updateDoc, deleteDoc } = require('firebase/firestore');
+const { configuredCloudStore } = require('./cloud-store');
 
+function createApp({ cloud: suppliedCloud } = {}) {
 const app = express();
-const PORT = process.env.PORT || 10000; 
 
 app.use(cors());
+app.use('/api/admin', createAdminAuth());
 app.use(express.json({ limit: '60mb' }));
 app.use(express.urlencoded({ limit: '60mb', extended: true }));
 
 let localTasksCache = {};
 let ticketCounter = 1;
-let db;
-let useFirebase = false;
+let cloudReady = false;
+let startupError = '';
+const retryTimers = new Map();
+const confirmations = new Set();
+let resetting = false;
 
 const appId = (process.env.APP_ID || "photo-booth-app").trim();
+const cloud = suppliedCloud || configuredCloudStore(appId);
 const LEONARDO_API_KEY = (process.env.LEONARDO_API_KEY || "").trim();
 const REMOVE_BG_MODE = "local-white";
 const OUTPUT_WIDTH = 1024;
@@ -41,38 +46,29 @@ const SCENES = Object.fromEntries(CATALOG.map(ip => [ip.id, {
 const Q_STYLE_REFERENCE_PATH = path.join(__dirname, "assets", "q-style-reference.jpg");
 const referenceCache = new Map();
 
-// Firebase 初始化 (僅在開機時連線一次)
-if (process.env.FIREBASE_CONFIG) {
-    try {
-        let configStr = process.env.FIREBASE_CONFIG.trim();
-        let firebaseConfig;
-        try { firebaseConfig = JSON.parse(configStr); } catch (jsonErr) {
-            let formatted = configStr.replace(/([{,]\s*)([a-zA-Z0-9_]+)\s*:/g, '$1"$2":').replace(/'/g, '"'); 
-            firebaseConfig = JSON.parse(formatted);
-        }
-        const firebaseApp = initializeApp(firebaseConfig);
-        db = getFirestore(firebaseApp);
-        useFirebase = true;
-        console.log("🔥 Firebase 雲端資料庫連線成功！");
-        syncTicketCounterFromCloud();
-    } catch (e) { console.error("❌ Firebase 初始化失敗:", e.message); }
-}
-
 // 僅在開機時載入一次歷史紀錄與續接流水號
 async function syncTicketCounterFromCloud() {
-    if (!useFirebase) return;
     try {
-        const querySnapshot = await getDocs(collection(db, 'artifacts', appId, 'public'));
+        const records = await cloud.load();
         let maxId = 0;
-        querySnapshot.forEach((doc) => {
-            const idNum = parseInt(doc.id, 10);
+        records.forEach(record => {
+            if (!/^\d{3,}$/.test(record.id)) return;
+            const idNum = parseInt(record.id, 10);
             if (!isNaN(idNum) && idNum > maxId) maxId = idNum;
-            localTasksCache[doc.id] = doc.data();
+            record.cloudStatus ||= 'legacy';
+            // Never repeat a billable job after restart. Allow recovery of the retained original URL.
+            if (record.status === 'pending') {
+                record.status = record.resultImageB ? 'completed' : 'failed';
+                record.remark = [record.remark, '服務重啟中斷任務；請檢查已有圖片或 Leonardo 任務紀錄，沒有自動重新產圖。'].filter(Boolean).join('；');
+            }
+            localTasksCache[record.id] = record;
         });
         ticketCounter = maxId + 1;
+        cloudReady = true;
         console.log(`🎯 流水號續接成功！下一位：#${String(ticketCounter).padStart(3, '0')}`);
-    } catch (e) {}
+    } catch (e) { startupError = '歷史訂單讀取失敗，為避免號碼重複，暫停接收新任務；請檢查資料庫權限後重新啟動。'; console.error(startupError); }
 }
+const ready = syncTicketCounterFromCloud();
 
 // 飛鵝印表機完美置中與放大排版
 async function triggerFeiePrint(task) {
@@ -202,15 +198,20 @@ async function requestGeneration(payload) {
     if (!id) throw new Error('Leonardo 未回傳任務 ID，請查詢帳戶紀錄再重試');
     return id;
 }
-async function saveGenerationState(task) {
-    if (useFirebase) await updateDoc(doc(db, 'artifacts', appId, 'public', task.id), {
-        status: task.status, remark: task.remark,
-        generationIdA: task.generationIdA || null, generationIdB: task.generationIdB || null,
-        originalGenerationUrlA: task.originalGenerationUrlA || null, originalGenerationUrlB: task.originalGenerationUrlB || null,
-        resultImageA: task.resultImageA, resultImageB: task.resultImageB,
-        printStatusA: task.printStatusA || null, printStatusB: task.printStatusB || null,
-        printWarningA: task.printWarningA || '', printWarningB: task.printWarningB || ''
-    }).catch(error => console.error('生成資料雲端同步失敗:', error.message));
+async function saveGenerationState(task, retries = 2) {
+    if (resetting || localTasksCache[task.id] !== task) return false;
+    clearTimeout(retryTimers.get(task.id)); retryTimers.delete(task.id);
+    let saved = false;
+    try { saved = await cloud.save(task); }
+    catch (_) { task.cloudStatus = 'failed'; task.cloudError = '雲端儲存未設定，請先完成 Storage 設定。'; }
+    if (!saved) {
+        console.error(`雲端保存失敗 #${task.id}：${task.cloudError}`);
+        if (retries > 0 && cloud.configured) {
+            const timer = setTimeout(() => saveGenerationState(task, retries - 1), retries === 2 ? 3000 : 10000);
+            timer.unref?.(); retryTimers.set(task.id, timer);
+        }
+    }
+    return saved;
 }
 async function runStyle(task, guestId, styleKey) {
     const scene = SCENES[task.sceneId];
@@ -247,8 +248,9 @@ async function runStyle(task, guestId, styleKey) {
             const url = job.generated_images?.[0]?.url;
             if (!url) throw new Error(`任務 ${id} 未回傳圖片`);
             task[`originalGenerationUrl${suffix}`] = url;
-            assignPrintResult(task, suffix, await finalizeFullScene(await downloadImageBuffer(url)));
+            // Save the recovery URL before local PNG processing. No paid generation is repeated on recovery.
             await saveGenerationState(task);
+            assignPrintResult(task, suffix, await finalizeFullScene(await downloadImageBuffer(url)));
             return;
         }
     }
@@ -271,6 +273,7 @@ async function generateLeonardoChibi(taskId, guestBuffer) {
 app.post('/api/admin/reprocess/:taskId', async (req,res) => {
     const task=localTasksCache[req.params.taskId];
     if(!task)return res.status(404).json({error:'找不到任務'});
+    if(resetting || confirmations.has(task.id))return res.status(409).json({error:'任務正在送出，請稍候'});
     if(task.reprocessing || task.status==='pending')return res.status(409).json({error:'任務仍在處理中'});
     const sides=(task.styleMode === 'chibi-only' ? ['B'] : ['A','B']).filter(s=>task[`originalGenerationUrl${s}`]);
     if(!sides.length)return res.status(400).json({error:'沒有保留的生成原圖，請從 Leonardo 下載後補傳'});
@@ -278,8 +281,8 @@ app.post('/api/admin/reprocess/:taskId', async (req,res) => {
     try {
         const results=await Promise.allSettled(sides.map(async s=>assignPrintResult(task,s,await finalizeFullScene(await downloadImageBuffer(task[`originalGenerationUrl${s}`])))));
         const errors=results.flatMap((r,i)=>r.status==='rejected'?[`${sides[i]}款原圖處理失敗：${r.reason.message}`]:[]);
-        updateTaskOutcome(task,errors); await saveGenerationState(task);
-        res.json({success:true,status:task.status,warning:task.remark});
+        updateTaskOutcome(task,errors); const saved=await saveGenerationState(task);
+        res.status(saved?200:503).json({success:saved,status:task.status,warning:task.remark,error:saved?null:task.cloudError});
     } finally { task.reprocessing=false; }
 });
 
@@ -292,13 +295,19 @@ app.post('/api/upload', async (req, res) => {
         catch { return res.status(400).json({ error: '照片格式無法讀取，請重新拍攝' }); }
         const scene = SCENES[sceneId];
         if (!scene) return res.status(400).json({ error: '不支援的互動情境' });
+        await ready;
+        if (resetting || !cloudReady || !cloud.configured) return res.status(503).json({ error: '圖片儲存服務尚未就緒，請工作人員確認設定後再試。' });
 
         const taskId = String(ticketCounter).padStart(3, '0');
         ticketCounter++;
 
         const newTask = { id: taskId, sourceImage: image, sceneId, sceneName: scene.name, styleMode: 'chibi-only', status: 'pending', resultImageA: null, resultImageB: null, chosenDesign: null, processStatus: '製作中', remark: '', styleBName: '合影', createdAt: new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false }) };
         localTasksCache[taskId] = newTask;
-        if (useFirebase) await setDoc(doc(db, 'artifacts', appId, 'public', taskId), newTask);
+        // Persist the source before the billable generation starts.
+        if (!await saveGenerationState(newTask, 0)) {
+            newTask.status = 'failed'; newTask.remark = '原照未保存，沒有呼叫付費產圖。';
+            return res.status(503).json({ error: '照片尚未成功保存，請稍後重試；本次沒有進行 AI 產圖。' });
+        }
 
         console.log(`🎫 新任務建立：排隊號碼 #${taskId}`);
         res.json({ success: true, taskId: taskId });
@@ -313,6 +322,7 @@ app.get('/health', (_req, res) => {
     res.json({
         success: true,
         booth: 'B',
+        adminAuthVersion: 'v16',
         pipelineVersion: 'leonardo-chibi-print-v13',
         imageProvider: 'leonardo-full-scene',
         imageProviderConfigured: !!LEONARDO_API_KEY,
@@ -325,15 +335,21 @@ app.get('/health', (_req, res) => {
         layeredComposite: false,
         removeBgMode: REMOVE_BG_MODE,
         scenes: Object.keys(SCENES),
-        firebase: useFirebase
+        firebase: cloud.hasMetadata,
+        storageVersion: 'v19',
+        storageConfigured: cloud.configured,
+        ordersLoaded: cloudReady,
+        acceptingUploads: cloudReady && cloud.configured && !resetting
     });
 });
 
 app.get('/api/status/:taskId', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    await ready;
+    if (!cloudReady) return res.status(503).json({ error: '訂單正在恢復，請稍後再試' });
     const taskId = req.params.taskId; let task = localTasksCache[taskId];
     if (!task) return res.status(404).json({ error: '找不到該號碼任務' });
-    res.json({ success: true, status: task.status, resultImageA: task.resultImageA, resultImageB: task.resultImageB, chosenDesign: task.chosenDesign, error: ['failed','partial'].includes(task.status) ? task.remark : null, printStatusA: task.printStatusA, printStatusB: task.printStatusB });
+    res.json({ success: true, status: task.status, resultImageA: task.resultImageA, resultImageB: task.resultImageB, chosenDesign: task.chosenDesign, error: ['failed','partial'].includes(task.status) ? task.remark : null, printStatusA: task.printStatusA, printStatusB: task.printStatusB, cloudStatus: task.cloudStatus });
 });
 
 app.post('/api/choice/:taskId', async (req, res) => {
@@ -342,26 +358,37 @@ app.post('/api/choice/:taskId', async (req, res) => {
     if (!['A','B'].includes(choice) || !task[`resultImage${choice}`]) return res.status(400).json({ error: '這款圖片尚未完成，請選擇已完成的款式' });
     if (task.styleMode === 'chibi-only' && choice !== 'B') return res.status(400).json({ error: '請確認本次合影' });
     if (task.reprocessing || task.status === 'pending') return res.status(409).json({ error: '圖片仍在處理中，請稍候再送出' });
+    if (resetting || confirmations.has(taskId)) return res.status(409).json({ error: '正在送出，請稍候' });
     // Guest confirmation does not certify print quality; preserve printStatus and warnings for staff.
-    task.chosenDesign = choice;
-    triggerFeiePrint(task);
-    if (useFirebase) await updateDoc(doc(db, 'artifacts', appId, 'public', taskId), { chosenDesign: choice });
-    res.json({ success: true });
+    confirmations.add(taskId);
+    const previousChoice = task.chosenDesign;
+    try {
+        if (!await saveGenerationState(task)) return res.status(503).json({ error: '合影尚未保存完成，請稍後再按確定；圖片仍可預覽。' });
+        task.chosenDesign = choice;
+        if (!await saveGenerationState(task, 0)) {
+            task.chosenDesign = previousChoice;
+            return res.status(503).json({ error: '確認資料尚未保存，請再按一次確定。' });
+        }
+        if (!previousChoice) triggerFeiePrint(task);
+        res.json({ success: true });
+    } finally { confirmations.delete(taskId); }
 });
 
 app.get('/api/admin/all-tasks', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    await ready;
+    if (!cloudReady) return res.status(503).json({ success: false, error: startupError });
     const all = Object.values(localTasksCache).sort((a, b) => a.id.localeCompare(b.id));
 
     if (req.query.lightweight === 'true') {
         const lightweightTasks = all.map(task => {
             const t = { ...task };
-            t.hasSourceImage = !!t.sourceImage; delete t.sourceImage;
+            t.hasSourceImage = !!(t.sourceImage || t.sourceImageFile); delete t.sourceImage;
             t.hasResultImageA = !!t.resultImageA; if (t.resultImageA && t.resultImageA.startsWith('data:')) delete t.resultImageA;
             t.hasResultImageB = !!t.resultImageB; if (t.resultImageB && t.resultImageB.startsWith('data:')) delete t.resultImageB;
             return t;
         });
-        return res.json({ success: true, tasks: lightweightTasks });
+        return res.json({ success: true, tasks: lightweightTasks, storageConfigured: cloud.configured, storageError: cloud.configurationError });
     }
     res.json({ success: true, tasks: all });
 });
@@ -369,7 +396,29 @@ app.get('/api/admin/all-tasks', async (req, res) => {
 app.get('/api/admin/task-source-image/:taskId', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     const taskId = req.params.taskId; let task = localTasksCache[taskId];
-    res.json({ success: true, sourceImage: task?.sourceImage });
+    if (!task) return res.status(404).json({ error: '找不到該任務' });
+    try {
+        const { buffer, mime } = await cloud.readImage(task, 'sourceImage');
+        res.json({ success: true, sourceImage: `data:${mime};base64,${buffer.toString('base64')}` });
+    } catch (_) { res.status(503).json({ error: '原照讀取失敗，請稍後重試' }); }
+});
+
+app.post('/api/admin/retry-save/:taskId', async (req, res) => {
+    const task = localTasksCache[req.params.taskId];
+    if (!task) return res.status(404).json({ error: '找不到該任務' });
+    if (resetting || task.reprocessing || task.status === 'pending' || confirmations.has(task.id)) return res.status(409).json({ error: '任務仍在處理中' });
+    const saved = await saveGenerationState(task);
+    res.status(saved ? 200 : 503).json({ success: saved, cloudStatus: task.cloudStatus, error: saved ? null : task.cloudError });
+});
+
+// An authenticated byte download keeps PNG filenames and transparency with remote URLs too.
+app.get('/api/admin/download/:taskId/:side', async (req, res) => {
+    const task = localTasksCache[req.params.taskId], side = req.params.side;
+    if (!task || !['A', 'B'].includes(side)) return res.status(404).json({ error: '找不到圖片' });
+    try {
+        const { buffer, mime } = await cloud.readImage(task, `resultImage${side}`);
+        res.type(mime).set('Content-Disposition', `attachment; filename="Portrait_B_${task.id}_${side}.${mime === 'image/png' ? 'png' : mime === 'image/webp' ? 'webp' : 'jpg'}"`).send(buffer);
+    } catch (_) { res.status(503).json({ error: '圖片下載失敗，請稍後重試' }); }
 });
 
 app.get('/api/admin/task-result-images/:taskId', async (req, res) => {
@@ -381,6 +430,7 @@ app.get('/api/admin/task-result-images/:taskId', async (req, res) => {
 app.post('/api/admin/upload-result-dual/:taskId', async (req, res) => {
     const task=localTasksCache[req.params.taskId];
     if(!task)return res.status(404).json({error:'找不到該任務'});
+    if(resetting || confirmations.has(task.id))return res.status(409).json({error:'任務正在送出，請稍候'});
     if(task.reprocessing || task.status==='pending')return res.status(409).json({error:'任務仍在處理中'});
     const sides=(task.styleMode==='chibi-only'?['B']:['A','B']).filter(s=>req.body[`resultImage${s}`]);
     if(!sides.length)return res.status(400).json({error:'請上傳合影圖片'});
@@ -388,8 +438,8 @@ app.post('/api/admin/upload-result-dual/:taskId', async (req, res) => {
     try {
         const prepared=await Promise.all(sides.map(async s=>[s,await finalizeFullScene(decodePhoto(req.body[`resultImage${s}`]))]));
         for(const [s,result] of prepared)assignPrintResult(task,s,result);
-        updateTaskOutcome(task);await saveGenerationState(task);
-        res.json({success:true});
+        updateTaskOutcome(task);const saved=await saveGenerationState(task);
+        res.status(saved?200:503).json({success:saved,error:saved?null:task.cloudError});
     } catch(error){res.status(400).json({error:'無法處理上傳圖片：'+error.message});}
     finally{task.reprocessing=false;}
 });
@@ -398,12 +448,15 @@ app.post('/api/admin/upload-result-dual/:taskId', async (req, res) => {
 app.post('/api/admin/approve-result/:taskId', async (req,res) => {
     const task=localTasksCache[req.params.taskId],side=req.body.choice;
     if(!task)return res.status(404).json({error:'找不到該任務'});
+    if(resetting || confirmations.has(task.id))return res.status(409).json({error:'任務正在送出，請稍候'});
     if(task.reprocessing || task.status==='pending')return res.status(409).json({error:'任務仍在處理中'});
     if(!['A','B'].includes(side) || req.body.confirmed!==true)return res.status(400).json({error:'請先檢查合影'});
     const image=task[`resultImage${side}`];
-    if(!image?.startsWith('data:image/png;base64,'))return res.status(400).json({error:'這是未去背預覽，請先補傳處理完成的透明 PNG'});
+    if(!image?.startsWith('data:image/png;base64,') && task[`resultImage${side}File`]?.mime !== 'image/png')return res.status(400).json({error:'這是未去背預覽，請先補傳處理完成的透明 PNG'});
+    task.reprocessing=true;
     try {
-        const {data,info}=await sharp(decodePhoto(image)).ensureAlpha().raw().toBuffer({resolveWithObject:true});
+        const {buffer}=await cloud.readImage(task, `resultImage${side}`);
+        const {data,info}=await sharp(buffer).ensureAlpha().raw().toBuffer({resolveWithObject:true});
         let visible=0;
         for(let y=0;y<info.height;y++)for(let x=0;x<info.width;x++) {
             const a=data[(y*info.width+x)*4+3];if(a>0)visible++;
@@ -411,21 +464,23 @@ app.post('/api/admin/approve-result/:taskId', async (req,res) => {
         }
         if(visible<100)throw Error('圖片沒有可見圖案');
         task[`printStatus${side}`]='ready';task[`printWarning${side}`]='工作人員已確認透明背景、完整構圖及邊緣';
-        updateTaskOutcome(task);await saveGenerationState(task);res.json({success:true});
+        updateTaskOutcome(task);const saved=await saveGenerationState(task);res.status(saved?200:503).json({success:saved,error:saved?null:task.cloudError});
     } catch(error){res.status(400).json({error:error.message});}
+    finally { task.reprocessing=false; }
 });
 
 app.post('/api/admin/reset-all', async (req, res) => {
+    if (resetting || confirmations.size || Object.values(localTasksCache).some(t => t.status === 'pending' || t.reprocessing || t.cloudStatus === 'saving'))
+        return res.status(409).json({ error: '還有任務正在處理或保存，請完成後再重製。' });
+    if (!cloud.configured || !cloudReady) return res.status(503).json({ error: '雲端未就緒，無法重製。' });
+    resetting = true;
     try {
+        for (const timer of retryTimers.values()) clearTimeout(timer); retryTimers.clear();
+        await cloud.removeRecords();
         localTasksCache = {}; ticketCounter = 1;
-        if (useFirebase) {
-            const querySnapshot = await getDocs(collection(db, 'artifacts', appId, 'public'));
-            const deletePromises = [];
-            querySnapshot.forEach((document) => { deletePromises.push(deleteDoc(doc(db, 'artifacts', appId, 'public', document.id))); });
-            await Promise.all(deletePromises);
-        }
         res.json({ success: true, message: "所有資料已重製" });
-    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+    } catch (error) { res.status(500).json({ success: false, error: '重製未完成，請重新整理後確認。' }); }
+    finally { resetting = false; }
 });
 
 // 🌟 新增：接收並儲存後台更改的「狀態」與「備註」
@@ -435,26 +490,18 @@ app.post('/api/admin/update-meta/:taskId', async (req, res) => {
     const task = localTasksCache[taskId];
     if (!task) return res.status(404).json({ error: '找不到該任務' });
 
+    if (resetting || task.reprocessing || confirmations.has(taskId)) return res.status(409).json({ error: '任務正在處理，請稍後再試' });
+    if (processStatus !== undefined && !['製作中', '已完成', '已取消'].includes(processStatus)) return res.status(400).json({ error: '狀態不正確' });
+    if (remark !== undefined && (typeof remark !== 'string' || remark.length > 2000)) return res.status(400).json({ error: '備註請限制在 2000 字以內' });
     if (processStatus !== undefined) task.processStatus = processStatus;
     if (remark !== undefined) task.remark = remark;
-
-    if (useFirebase) {
-        try {
-            await updateDoc(doc(db, 'artifacts', appId, 'public', taskId), { 
-                processStatus: task.processStatus, 
-                remark: task.remark 
-            });
-        } catch (e) { console.error("Firebase 更新狀態/備註失敗:", e); }
-    }
-    res.json({ success: true });
+    const saved = await saveGenerationState(task);
+    res.status(saved ? 200 : 503).json({ success: saved, error: saved ? null : task.cloudError });
 });
 
-if (require.main === module) {
-    app.listen(PORT, () => { console.log(`🚀 雙重風格叫號伺服器運行中，監聽 PORT: ${PORT}`); });
-}
-
-module.exports = {
-    app,
+return {
+    app, ready,
+    close() { for (const timer of retryTimers.values()) clearTimeout(timer); retryTimers.clear(); },
     testHelpers: {
         SCENES,
         finalizeFullScene,
@@ -462,3 +509,9 @@ module.exports = {
         leonardoPayload
     }
 };
+}
+if (require.main === module) {
+    const instance = createApp();
+    instance.app.listen(process.env.PORT || 10000, () => console.log('B 機後端 v19 已啟動'));
+}
+module.exports = { createApp };
