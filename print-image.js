@@ -141,7 +141,7 @@ async function preparePrintPng(buffer,{width=1024,height=768,margin=.08,diagnost
     const inner=await sharp(data,{raw:info}).extract({left,top,width:right-left+1,height:bottom-top+1}).resize(width-2*mx,height-2*my,{fit:'contain',background:'#00000000'}).png().toBuffer();
     return sharp({create:{width,height,channels:4,background:'#00000000'}}).composite([{input:inner,left:mx,top:my}]).png({compressionLevel:9}).toBuffer();
 }
-async function preparePrintResult(buffer,options={}) {
+async function prepareUnbrandedResult(buffer,options={}) {
     const diagnostics={};
     try {
         const png=await preparePrintPng(buffer,{...options,diagnostics});
@@ -153,4 +153,28 @@ async function preparePrintResult(buffer,options={}) {
         return {buffer:jpeg,mime:'image/jpeg',printStatus:'review',warning:`保留未去背預覽，需人工處理：${error.message}`};
     }
 }
+
+// Add the official vector artwork AFTER background removal, so its white details survive.
+// Extend the canvas instead of reducing the guest illustration's resolution.
+async function preparePrintResult(buffer, options = {}) {
+    const result = await prepareUnbrandedResult(buffer, options);
+    const { width, height } = await sharp(result.buffer).metadata();
+    const logoWidth = Math.round(width * 0.34);
+    const logo = await sharp(require('path').join(__dirname, 'assets', 'event-title.svg'), { density: 192 })
+        .resize({ width: logoWidth }).png().toBuffer();
+    const logoMeta = await sharp(logo).metadata();
+    const gap = Math.max(16, Math.round(width * 0.016));
+    const bottomMargin = Math.ceil(width * (options.margin ?? 0.08));
+    const output = await sharp({
+        create: {
+            width, height: height + gap + logoMeta.height + bottomMargin,
+            channels: 4, background: '#00000000'
+        }
+    }).composite([
+        { input: result.buffer, left: 0, top: 0 },
+        { input: logo, left: Math.floor((width - logoMeta.width) / 2), top: height + gap }
+    ]).png({ compressionLevel: 9 }).toBuffer();
+    return { ...result, buffer: output, mime: 'image/png' };
+}
 module.exports={preparePrintPng,preparePrintResult};
+
