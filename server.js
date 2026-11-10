@@ -378,7 +378,11 @@ app.get('/api/admin/all-tasks', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     await ready;
     if (!cloudReady) return res.status(503).json({ success: false, error: startupError });
-    const all = Object.values(localTasksCache).sort((a, b) => a.id.localeCompare(b.id));
+    const allRecords = Object.values(localTasksCache);
+    const limited = req.query.limit === '50';
+    const all = limited
+        ? allRecords.filter(t => /^\d{3,}$/.test(t.id)).sort((a,b) => Number(b.id)-Number(a.id)).slice(0,50)
+        : allRecords.sort((a,b) => a.id.localeCompare(b.id));
 
     if (req.query.lightweight === 'true') {
         const lightweightTasks = all.map(task => {
