@@ -80,7 +80,7 @@ async function triggerFeiePrint(task) {
     const stime = Math.floor(Date.now() / 1000);
     const sig = crypto.createHash('sha1').update(user + ukey + stime).digest('hex');
 
-    let content = `<CB>專屬禮品兌換</CB><BR>`;
+    let content = `<CB>AI方舟 航向數位平權</CB><BR>`;
     content += `<C>--------------------------------</C><BR>`;
     content += `<BR><CB>${task.id}</CB><BR><BR>`; 
     content += `<C>--------------------------------</C><BR>`;
