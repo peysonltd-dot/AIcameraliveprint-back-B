@@ -88,9 +88,7 @@ async function triggerFeiePrint(task) {
     content += `<C>--------------------------------</C><BR>`;
     content += `<C><B>領取說明：</B></C><BR>`;
     content += `<C>領取時請出示此號碼牌</C><BR>`;
-    content += `<C>交由工作人員兌換您的禮品</C><BR><BR>`;
-    content += `<CB>～感謝您的參與～</CB><BR>`;
-    content += `<CB>～祝您體驗愉快～</CB><BR>`;
+    content += `<C>交由工作人員兌換您的禮品</C><BR>`;
 
     const params = new URLSearchParams();
     params.append('user', user); params.append('stime', stime.toString()); params.append('sig', sig);
